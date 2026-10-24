@@ -383,14 +383,74 @@ _idle_priority_tasks = {}  # Track P2+ priority rollout: {task_id: {'start_time'
 
 
 def _is_agent_exempt_from_idle_priority(agent) -> bool:
-    """Check if an agent is exempt from idle priority (P1 or Region-first member)."""
-    if agent.priority == 1:
-        return True
-    if fleet_state:
-        regions = fleet_state._get_agent_regions(agent)
-        if any(region.get('sharing_mode') == 'region_first' for region in regions):
+    """Region-first agents join a wave once it has opened past priority 1.
+
+    Priority 1 is a real tier on regular tasks: an idle priority-1 agent gets
+    the first window, then the task trickles down. They are not added to every wave.
+    """
+    if not fleet_state or getattr(agent, 'priority', None) == 1:
+        return False
+    regions = fleet_state._get_agent_regions(agent)
+    return any(region.get('sharing_mode') == 'region_first' for region in regions)
+
+
+def _p1_can_receive_regular(agent, task_id: str) -> bool:
+    """True when this idle priority-1 agent can be offered this one regular task.
+
+    A premium offer does not use up the regular option. An assigned task, or a
+    different regular offer that is still pending, does.
+    """
+    if getattr(agent, 'priority', None) != 1:
+        return False
+    if agent.current_tasks:
+        return False
+    task_key = str(task_id)
+    for pending_id in get_agent_pending_tasks(agent.id):
+        pending_key = str(pending_id)
+        if pending_key == task_key:
+            continue
+        pending_task = fleet_state.get_task(pending_key) if fleet_state else None
+        if pending_task is None or not pending_task.is_premium_task:
+            return False
+    return True
+
+
+_opening_regular_windows = set()
+
+
+def _any_idle_p1_open_for_regular() -> bool:
+    """True when some online priority-1 agent can still take one regular task."""
+    if not fleet_state:
+        return False
+    for agent in fleet_state.get_all_agents():
+        if agent.priority == 1 and agent.is_online and _p1_can_receive_regular(agent, ""):
             return True
     return False
+
+
+def _open_regular_priority_window(task_id: str, dashboard_url: str):
+    """Start the shared first push for a regular task that does not have one yet."""
+    task_key = str(task_id)
+    if task_key in _opening_regular_windows or _is_task_in_idle_priority(task_key):
+        return
+    _opening_regular_windows.add(task_key)
+    try:
+        trigger_proximity_broadcast(
+            task_id=task_key,
+            triggered_by_agent="priority_1_regular",
+            dashboard_url=dashboard_url,
+            force=False,
+        )
+    finally:
+        _opening_regular_windows.discard(task_key)
+
+
+def _region_first_joins_wave(priority_levels, rollout_level: int) -> bool:
+    """Region-first agents wait outside an exclusive idle priority-1 window."""
+    unlocked = list(priority_levels)[:rollout_level + 1]
+    if any(level >= 2 for level in unlocked):
+        return True
+    return 1 not in list(priority_levels)
 
 
 def _is_task_in_idle_priority(task_id: str) -> bool:
@@ -1655,18 +1715,41 @@ def trigger_proximity_broadcast(
             _task_offer_times[task_id] = now
         first_offered_at = _task_offer_times[task_id]
     
+    # A regular task can use up the one regular option of an idle priority-1
+    # agent. Premium tasks stay on the premium gate above and are not limited here.
+    if not is_premium_task:
+        regular_p1 = []
+        other_feasible = []
+        skipped_p1 = []
+        for agent_info in feasible_agents:
+            if agent_info.get('priority') != 1:
+                other_feasible.append(agent_info)
+                continue
+            agent_obj = fleet_state.get_agent(agent_info['agent_id']) if fleet_state else None
+            if agent_obj and _p1_can_receive_regular(agent_obj, task_id):
+                regular_p1.append(agent_info)
+            else:
+                skipped_p1.append(agent_info.get('agent_name') or agent_info.get('agent_id'))
+        if skipped_p1:
+            log_event(
+                f"[ProximityBroadcast] ⭐ Regular task {task.restaurant_name} skipped priority-1 agents "
+                f"who already have a task or a regular offer: {skipped_p1}"
+            )
+        feasible_agents = regular_p1 + other_feasible
+
     # =========================================================================
-    # PRIORITY ROLLOUT (P2+ ONLY):
-    # - First push: idle agents in the highest available priority tier (lowest number >= 2)
-    # - Each forced re-broadcast widens to include the next idle priority tier
-    # - After all tiers are exhausted, fallback to all feasible agents
-    # Exempt: P1 and region-based agents stay included as before.
+    # PRIORITY ROLLOUT:
+    # - Regular task with an idle priority-1 agent: that agent gets the first
+    #   push alone. The timer then opens idle priority 2, then the next tier.
+    # - Otherwise the first push is the highest idle priority tier at 2 or lower.
+    # - After every tier, the task opens to the remaining feasible agents.
+    # Region-first agents join once the wave includes priority 2 or lower.
     # =========================================================================
     is_first_broadcast = not previous_agents
     task_in_idle_priority = _is_task_in_idle_priority(task_id)
 
     if task_in_idle_priority and advance_priority_rollout:
-        # Forced rebroadcast while rollout is active -> widen to next priority tier.
+        # The priority timer widens the offer to the next idle tier.
         with _proximity_lock:
             entry = _idle_priority_tasks.get(task_id, {})
             priority_levels = list(entry.get('priority_levels') or [])
@@ -1678,17 +1761,25 @@ def trigger_proximity_broadcast(
             rollout_agents = []
             deferred_agents = []
             exempt_agents = []
+            include_region_first = _region_first_joins_wave(priority_levels, next_level)
             for a in feasible_agents:
                 agent_obj = fleet_state.get_agent(a['agent_id']) if fleet_state else None
-                if agent_obj and _is_agent_exempt_from_idle_priority(agent_obj):
+                if include_region_first and agent_obj and _is_agent_exempt_from_idle_priority(agent_obj):
                     exempt_agents.append(a)
                     continue
                 priority_val = a.get('priority')
                 is_idle = a.get('current_task_count', 0) == 0
-                if is_idle and isinstance(priority_val, int) and priority_val >= 2 and priority_val in unlocked_priorities:
+                if (
+                    is_idle
+                    and isinstance(priority_val, int)
+                    and priority_val >= 1
+                    and priority_val in unlocked_priorities
+                ):
                     rollout_agents.append(a)
                 else:
                     deferred_agents.append(a)
+            if not include_region_first:
+                deferred_agents.extend(exempt_agents)
 
             if rollout_agents:
                 feasible_agents = sorted(rollout_agents, key=lambda x: (x.get('priority') or 999, x['distance_km'])) + exempt_agents
@@ -1708,7 +1799,7 @@ def trigger_proximity_broadcast(
             _clear_idle_priority(task_id)
             log_event(f"[ProximityBroadcast] ⏰ PRIORITY ROLLOUT COMPLETE: {task.restaurant_name} → falling back to all agents")
     elif is_first_broadcast and not task_in_idle_priority:
-        # First broadcast for this task: start with highest-priority idle P2+ tier only.
+        # First push: idle priority 1 for a regular task, otherwise the best idle tier at 2 or lower.
         first_wave = []
         deferred_agents = []
         exempt_agents = []
@@ -1717,11 +1808,13 @@ def trigger_proximity_broadcast(
             agent_obj = fleet_state.get_agent(a['agent_id']) if fleet_state else None
             if agent_obj and _is_agent_exempt_from_idle_priority(agent_obj):
                 exempt_agents.append(a)
-            else:
-                priority_val = a.get('priority')
-                is_idle = a.get('current_task_count', 0) == 0
-                if is_idle and isinstance(priority_val, int) and priority_val >= 2:
-                    priority_levels.add(priority_val)
+                continue
+            priority_val = a.get('priority')
+            is_idle = a.get('current_task_count', 0) == 0
+            if is_idle and isinstance(priority_val, int) and priority_val >= 2:
+                priority_levels.add(priority_val)
+            elif not is_premium_task and is_idle and priority_val == 1:
+                priority_levels.add(1)
 
         sorted_levels = sorted(priority_levels)
         if sorted_levels:
@@ -1736,15 +1829,20 @@ def trigger_proximity_broadcast(
                     deferred_agents.append(a)
 
         if first_wave:
+            include_region_first = first_priority >= 2
+            if not include_region_first:
+                deferred_agents.extend(exempt_agents)
+            wave_exempt = exempt_agents if include_region_first else []
             first_wave = sorted(first_wave, key=lambda x: x['distance_km'])
-            feasible_agents = first_wave + exempt_agents
+            feasible_agents = first_wave + wave_exempt
             allowed_agent_ids = set(a['agent_id'] for a in first_wave)
             _set_idle_priority(task_id, allowed_agent_ids, sorted_levels, 0)
-            exempt_names = [a['agent_name'] for a in exempt_agents]
+            exempt_names = [a['agent_name'] for a in wave_exempt]
+            regular_note = " (one regular task while idle)" if first_priority == 1 else ""
             log_event(
                 f"[ProximityBroadcast] 💤 PRIORITY ROLLOUT START: {task.restaurant_name} → "
-                f"idle P{first_priority} agents: {[a['agent_name'] for a in first_wave]}"
-                + (f", {len(exempt_agents)} exempt: {exempt_names}" if exempt_agents else "")
+                f"idle P{first_priority} agents: {[a['agent_name'] for a in first_wave]}{regular_note}"
+                + (f", {len(wave_exempt)} exempt: {exempt_names}" if wave_exempt else "")
                 + (f" | deferred: {[a['agent_name'] for a in deferred_agents]}" if deferred_agents else "")
                 + f" | timeout: {PROXIMITY_TASK_TIMEOUT_SECONDS}s"
             )
@@ -1972,20 +2070,43 @@ def trigger_batched_proximity_broadcast(
     skipped_at_limit = []
     skipped_declined = []
     skipped_idle_priority = []
+    skipped_regular_cap = []
     skipped_ineligible = []
+    regular_window_task_ids = []
+    regular_included = False
     is_exempt = _is_agent_exempt_from_idle_priority(agent)
     for task_id in task_ids:
         task_id = str(task_id)
         task = fleet_state.get_task(task_id)
         if task and task.status == TaskStatus.UNASSIGNED:
-            # Skip tasks in idle-priority window (unless this agent is exempt or was one of the idle agents)
-            if _is_task_in_idle_priority(task_id) and not is_exempt:
+            # One regular offer at a time. A second regular in this batch is not sent.
+            if agent.priority == 1 and not task.is_premium_task and (
+                not _p1_can_receive_regular(agent, task_id) or regular_included
+            ):
+                skipped_regular_cap.append(task.restaurant_name)
+                continue
+
+            # A regular task with no priority window yet belongs to the shared
+            # first push, so an idle priority-1 agent gets it before anyone else.
+            if (
+                not task.is_premium_task
+                and not _is_task_in_idle_priority(task_id)
+                and _any_idle_p1_open_for_regular()
+            ):
+                regular_window_task_ids.append(task_id)
+                skipped_idle_priority.append(task.restaurant_name)
+                continue
+
+            # During an exclusive priority-1 window, only the idle priority-1 agents
+            # in the hold receive the task. Region-first agents join with later tiers.
+            if _is_task_in_idle_priority(task_id):
                 with _proximity_lock:
-                    entry = _idle_priority_tasks.get(task_id)
-                    allowed_ids = set()
-                    if entry:
-                        allowed_ids = set(entry.get('allowed_agent_ids') or entry.get('idle_agent_ids') or [])
-                if str(agent_id) not in allowed_ids:
+                    entry = _idle_priority_tasks.get(task_id) or {}
+                    allowed_ids = set(entry.get('allowed_agent_ids') or entry.get('idle_agent_ids') or [])
+                    hold_levels = list(entry.get('priority_levels') or [])
+                    hold_level = int(entry.get('rollout_level', 0))
+                region_exempt = is_exempt and _region_first_joins_wave(hold_levels, hold_level)
+                if str(agent_id) not in allowed_ids and not region_exempt:
                     skipped_idle_priority.append(task.restaurant_name)
                     continue
 
@@ -2010,10 +2131,21 @@ def trigger_batched_proximity_broadcast(
                 continue
             
             valid_tasks.append(task)
+            if agent.priority == 1 and not task.is_premium_task:
+                regular_included = True
             # Stop when we hit broadcast capacity limit
             if len(valid_tasks) >= broadcast_capacity:
                 break
     
+    for window_task_id in regular_window_task_ids:
+        _open_regular_priority_window(window_task_id, dashboard_url)
+
+    if skipped_regular_cap:
+        log_event(
+            f"[ProximityBroadcast] ⭐ Batched: {agent_name} keeps one regular option; "
+            f"skipping {skipped_regular_cap}"
+        )
+
     if skipped_idle_priority:
         log_event(f"[ProximityBroadcast] 💤 Batched: Skipping {len(skipped_idle_priority)} idle-priority tasks for {agent_name} (busy agent): {skipped_idle_priority}")
     
@@ -3960,6 +4092,13 @@ def handle_get_recommendations(data):
                 
                 # Check business rule eligibility
                 eligibility = fleet_state._check_eligibility(agent, task, override_max_distance_km=search_radius)
+                if (
+                    eligibility is None
+                    and agent.priority == 1
+                    and not task.is_premium_task
+                    and not _p1_can_receive_regular(agent, task.id)
+                ):
+                    eligibility = "priority1_regular_already_offered"
                 
                 if eligibility is None and min_dist <= search_radius:
                     try:

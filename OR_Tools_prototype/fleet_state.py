@@ -1721,9 +1721,11 @@ class FleetState:
             return f"customer_exemption_{customer_exemption_source}"
 
         # 0a. PRIORITY AGENT RULES
-        # Priority 1 agents ONLY get premium tasks (configurable thresholds)
-        if agent.priority == 1:
-            if not task.is_premium_task:
+        # Premium tasks stay available to priority 1. A regular task is an
+        # option only while that agent has no assigned task. The broadcast
+        # layer also limits them to one regular offer at a time.
+        if agent.priority == 1 and not task.is_premium_task:
+            if agent.current_tasks:
                 return "priority1_non_premium"
         
         # 0b. TAG MATCHING RULES
