@@ -394,16 +394,13 @@ def _is_agent_exempt_from_idle_priority(agent) -> bool:
 
 
 def _is_task_in_idle_priority(task_id: str) -> bool:
-    """Check if a task is currently in its idle-priority window."""
+    """Check if a task is still reserved for its current P2+ priority tier.
+
+    The reservation stays until the priority timer advances or ends it.
+    Elapsed time alone must not release the task to a later event.
+    """
     with _proximity_lock:
-        entry = _idle_priority_tasks.get(task_id)
-        if not entry:
-            return False
-        elapsed = time.time() - entry['start_time']
-        if elapsed >= PROXIMITY_TASK_TIMEOUT_SECONDS:
-            del _idle_priority_tasks[task_id]
-            return False
-        return True
+        return task_id in _idle_priority_tasks
 
 
 def _set_idle_priority(task_id: str, allowed_agent_ids: set, priority_levels: list, rollout_level: int):
@@ -1191,12 +1188,174 @@ def _evaluate_new_tasks_for_agent(agent, new_tasks) -> dict:
     )
 
 
+def _agent_meets_direction_for_task(agent_id: str, task) -> bool:
+    """True when this task's delivery does not fight the agent's current route."""
+    task_bearing = get_task_delivery_bearing(task)
+    skip_direction = (
+        getattr(task, 'job_type', 'PAIRED') == 'DELIVERY'
+        or getattr(task, 'pickup_completed', False)
+    )
+    if skip_direction or task_bearing is None:
+        return True
+    is_compatible, _reason = is_task_directionally_compatible_with_pending(
+        task_bearing, agent_id, new_task=task
+    )
+    return is_compatible
+
+
+def _qualify_broadcast_candidates(agent_infos, task, task_declined_by, search_radius):
+    """Apply direction, decline, and delivery-lateness checks to one agent group.
+
+    Returns feasible agents, agents rejected by the route check, and a failure
+    payload when the group produces nobody. The caller decides whether to try
+    the next group.
+    """
+    task_id = str(task.id)
+    task_bearing = get_task_delivery_bearing(task)
+    skip_direction = (
+        getattr(task, 'job_type', 'PAIRED') == 'DELIVERY'
+        or getattr(task, 'pickup_completed', False)
+    )
+
+    agents_compatible = []
+    agents_incompatible = []
+    for agent_info in agent_infos:
+        agent = agent_info['agent']
+        if skip_direction or task_bearing is None or _agent_meets_direction_for_task(agent.id, task):
+            agents_compatible.append(agent_info)
+        else:
+            _compatible, reason = is_task_directionally_compatible_with_pending(
+                task_bearing, agent.id, new_task=task
+            )
+            agents_incompatible.append({
+                'agent_id': agent.id,
+                'agent_name': agent.name,
+                'reason': reason
+            })
+
+    if agents_incompatible:
+        names = [f"{a['agent_name']}({a['reason']})" for a in agents_incompatible]
+        log_event(f"[ProximityBroadcast] 🧭 Skipping {len(agents_incompatible)} agents with incompatible direction for {task.restaurant_name}: {names}")
+
+    if not agents_compatible:
+        log_event(f"[ProximityBroadcast] ⚠️ All agents have incompatible directions for {task.restaurant_name} (bearing {round(task_bearing)}°)")
+        return [], [], {
+            'success': False,
+            'error': 'All agents have incompatible directions (current tasks or pending)',
+            'task_bearing': round(task_bearing) if task_bearing is not None else None,
+            'agents_incompatible': agents_incompatible,
+            'radius_km': search_radius
+        }
+
+    agents_not_declined = []
+    agents_declined = []
+    for agent_info in agents_compatible:
+        agent = agent_info['agent']
+        if str(agent.id) in task_declined_by:
+            agents_declined.append({
+                'agent_id': agent.id,
+                'agent_name': agent.name
+            })
+        else:
+            agents_not_declined.append(agent_info)
+
+    if agents_declined:
+        names = [a['agent_name'] for a in agents_declined]
+        log_event(f"[ProximityBroadcast] 🚫 Skipping {len(agents_declined)} agents who declined {task.restaurant_name}: {names}")
+
+    if not agents_not_declined:
+        log_event(f"[ProximityBroadcast] ⚠️ All nearby agents have declined {task.restaurant_name} - needs manual assignment")
+        return [], [], {
+            'success': False,
+            'error': 'All nearby agents have declined this task',
+            'declined_by': list(task_declined_by),
+            'radius_km': search_radius,
+            'blocked': True,
+            'blocked_reason': 'all_declined'
+        }
+
+    feasible_agents = []
+    infeasible_agents = []
+    for agent_info in agents_not_declined:
+        agent = agent_info['agent']
+        pending_count = len([
+            pending_id for pending_id in get_agent_pending_tasks(agent.id)
+            if str(pending_id) != task_id
+        ])
+        if pending_count > 0:
+            log_event(f"[ProximityBroadcast] 🔄 Including {pending_count} pending tasks in feasibility check for {agent.name}")
+
+        try:
+            evaluation = _evaluate_new_tasks_for_agent(agent, [task])
+            selected = {str(selected_id) for selected_id in evaluation.get('selected_task_ids') or []}
+            if evaluation.get('feasible') and task_id in selected:
+                eta_info = evaluation.get('stops') or []
+                feasible_agents.append({
+                    'agent_id': agent.id,
+                    'agent_name': agent.name,
+                    'distance_km': round(agent_info['distance_km'], 2),
+                    'location': [agent.current_location.lat, agent.current_location.lng] if agent.current_location else None,
+                    'current_task_count': len(agent.current_tasks),
+                    'available_capacity': agent.available_capacity,
+                    'priority': agent.priority,
+                    'solver_verified': True,
+                    'eta_stops': eta_info,
+                    'has_route': bool(eta_info),
+                    'score': evaluation.get('score'),
+                    'delivery_lateness_minutes': evaluation.get('delivery_lateness_minutes'),
+                })
+            else:
+                infeasible_agents.append({
+                    'agent_id': agent.id,
+                    'agent_name': agent.name,
+                    'reason': evaluation.get('reason') or 'excessive_delivery_lateness'
+                })
+        except Exception as e:
+            infeasible_agents.append({
+                'agent_id': agent.id,
+                'agent_name': agent.name,
+                'reason': f'solver_error: {str(e)}'
+            })
+
+    if feasible_agents:
+        route_blocked = []
+        route_allowed = []
+        for agent in feasible_agents:
+            is_allowed, reason = is_multi_offer_allowed_with_route(agent.get('has_route', True), agent['agent_id'])
+            if is_allowed:
+                route_allowed.append(agent)
+            else:
+                route_blocked.append({
+                    'agent_id': agent['agent_id'],
+                    'agent_name': agent['agent_name'],
+                    'reason': reason
+                })
+
+        if route_blocked:
+            names = [f"{a['agent_name']}({a['reason']})" for a in route_blocked]
+            log_event(f"[ProximityBroadcast] 🛑 Skipping {len(route_blocked)} agents due to missing route multi-offer guard for {task.restaurant_name}: {names}")
+
+        feasible_agents = route_allowed
+
+    if not feasible_agents:
+        log_event(f"[ProximityBroadcast] ⚠️ No feasible agents for {task.restaurant_name} (solver rejected all)")
+        return [], infeasible_agents, {
+            'success': False,
+            'error': 'No feasible agents (excessive delivery lateness)',
+            'infeasible': infeasible_agents,
+            'radius_km': search_radius
+        }
+
+    return feasible_agents, infeasible_agents, None
+
+
 def trigger_proximity_broadcast(
     task_id: str,
     triggered_by_agent: str,
     dashboard_url: str,
     radius_km: float = None,
-    force: bool = False
+    force: bool = False,
+    advance_priority_rollout: bool = False
 ) -> dict:
     """
     Run solver for a SINGLE task with all nearby agents in BROADCAST mode.
@@ -1208,16 +1367,20 @@ def trigger_proximity_broadcast(
     3. Broadcasts task:proximity to those agents, scored from delivery lateness
     
     OPTIMIZATION: Only broadcasts if:
-    - force=True (timeout, expand, decline events)
+    - The priority timer asks to advance the P2+ hold
+    - force=True outside that hold (expand, task update, agent online)
     - OR a NEW agent enters the feasible set
     - Skips broadcast if same agents are still feasible (no spam)
+    While a P2+ priority hold is active, only the timer may send another push.
     
     Args:
         task_id: The task to broadcast
         triggered_by_agent: Name of agent who triggered proximity (for logging)
         dashboard_url: Dashboard URL for callbacks
         radius_km: Search radius (uses expanded radius if set, else default)
-        force: If True, always broadcast (used for timeout/expand/decline)
+        force: If True, broadcast even when the feasible set has not changed
+        advance_priority_rollout: If True, this is the priority timer and may
+            widen or end the P2+ hold. Every other caller leaves that hold alone.
     
     Returns: {
         'success': bool,
@@ -1244,9 +1407,14 @@ def trigger_proximity_broadcast(
     # Tookan won't push to agents who declined, but WILL push to other agents
     task_declined_by = set(str(d) for d in (task.declined_by or []))
     
-    # Suppress non-forced broadcasts for tasks in idle-priority window
-    # (idle agents have exclusive access until timeout)
-    if not force and _is_task_in_idle_priority(task_id):
+    # P2+ agents keep the task until the priority timer. Agent online, task
+    # updates, radius expansion, and other forced events must not open it early.
+    if _is_task_in_idle_priority(task_id) and not advance_priority_rollout:
+        if force:
+            log_event(
+                f"[ProximityBroadcast] 💤 Idle-priority hold active for {task.restaurant_name}; "
+                f"ignoring forced broadcast from {triggered_by_agent} until the timer"
+            )
         return {'success': True, 'idle_priority_active': True}
 
     # Debounce per-task broadcasts (skip debounce for forced events like timeout/expand/decline)
@@ -1408,182 +1576,56 @@ def trigger_proximity_broadcast(
         log_event(f"[ProximityBroadcast] ⚠️ All agents hit broadcast limit ({PROXIMITY_MAX_BROADCASTS_PER_AGENT}x) for {task.restaurant_name}")
         return {'success': False, 'error': f'All agents hit broadcast limit ({PROXIMITY_MAX_BROADCASTS_PER_AGENT}x)', 'agents_at_limit': agents_at_limit, 'radius_km': search_radius}
     
-    # PREMIUM EXCLUSIVITY: Premium tasks go ONLY to P1 agents when they're available
-    # This ensures P1 agents don't "share" their premium orders with regular agents
+    # Premium tasks try priority-1 agents first. Regular agents are checked
+    # only after every priority-1 agent fails direction, decline, or lateness.
+    # Priority 2 and below are not filtered here; their dibs run later, and
+    # only among agents who already passed these requirements.
+    candidate_groups = [agents_under_limit]
     if is_premium_task:
         p1_agents = [a for a in agents_under_limit if a['agent'].priority == 1]
         regular_agents = [a for a in agents_under_limit if a['agent'].priority != 1]
-        
+        p1_already_has_task = False
+        for candidate in eligible_agents:
+            if candidate['agent'].priority != 1:
+                continue
+            if task_id in {str(pending_id) for pending_id in get_agent_pending_tasks(candidate['agent'].id)}:
+                p1_already_has_task = True
+                log_event(f"[ProximityBroadcast] ⭐ PREMIUM HELD: {task.restaurant_name} already pending for P1 agent {candidate['agent'].name}. Not leaking to regular agents.")
+                break
+
+        if p1_already_has_task and not p1_agents:
+            return {'success': True, 'held_for_p1': True, 'reason': 'Already pending for P1 agent', 'radius_km': search_radius}
+
         if p1_agents:
-            # P1 agents available - make this premium task exclusive to them
             p1_names = [a['agent'].name for a in p1_agents]
-            regular_names = [a['agent'].name for a in regular_agents]
-            if regular_agents:
-                log_event(f"[ProximityBroadcast] ⭐ PREMIUM EXCLUSIVE: {task.restaurant_name} reserved for P1 agents: {p1_names}. Excluding regular agents: {regular_names}")
-            else:
-                log_event(f"[ProximityBroadcast] ⭐ PREMIUM EXCLUSIVE: {task.restaurant_name} going to P1 agents only: {p1_names}")
-            agents_under_limit = p1_agents
+            log_event(f"[ProximityBroadcast] ⭐ PREMIUM EXCLUSIVE: {task.restaurant_name} trying P1 agents first: {p1_names}")
+            candidate_groups = [p1_agents]
+            if regular_agents and not p1_already_has_task:
+                candidate_groups.append(regular_agents)
         else:
-            # No P1 agents in the filtered list — but check if a P1 agent already
-            # has this task as a pending broadcast (at capacity because of THIS task).
-            # If so, the task is already with the P1 agent; don't leak to regular agents.
-            p1_already_has_task = False
-            for a in eligible_agents:
-                if a['agent'].priority == 1:
-                    pending = get_agent_pending_tasks(a['agent'].id)
-                    if task_id in pending:
-                        p1_already_has_task = True
-                        log_event(f"[ProximityBroadcast] ⭐ PREMIUM HELD: {task.restaurant_name} already pending for P1 agent {a['agent'].name}. Not leaking to regular agents.")
-                        break
-            
-            if p1_already_has_task:
-                # Task is already with a P1 agent — only broadcast to new regular agents
-                # if this was a forced re-broadcast, otherwise skip entirely
-                agents_under_limit = []
-            else:
-                # No P1 agents available at all - fall back to regular agents
-                log_event(f"[ProximityBroadcast] ⭐ PREMIUM FALLBACK: No P1 agents available for {task.restaurant_name}, allowing regular agents")
-    
-    if is_premium_task and not agents_under_limit and any(
-        a['agent'].priority == 1 and task_id in get_agent_pending_tasks(a['agent'].id)
-        for a in eligible_agents
-    ):
-        return {'success': True, 'held_for_p1': True, 'reason': 'Already pending for P1 agent', 'radius_km': search_radius}
-    
-    # Calculate this task's bearing for directional compatibility check
-    # Skip direction filter entirely for delivery-only or pickup-completed tasks
-    task_bearing = get_task_delivery_bearing(task)
-    skip_direction = (
-        getattr(task, 'job_type', 'PAIRED') == 'DELIVERY'
-        or getattr(task, 'pickup_completed', False)
-    )
-    
-    # Filter agents by directional compatibility with their pending broadcasts
-    agents_compatible = []
-    agents_incompatible = []
-    for agent_info in agents_under_limit:
-        agent = agent_info['agent']
-        if skip_direction or task_bearing is None:
-            agents_compatible.append(agent_info)
-        else:
-            is_compatible, reason = is_task_directionally_compatible_with_pending(task_bearing, agent.id, new_task=task)
-            if is_compatible:
-                agents_compatible.append(agent_info)
-            else:
-                agents_incompatible.append({
-                    'agent_id': agent.id,
-                    'agent_name': agent.name,
-                    'reason': reason
-                })
-    
-    if agents_incompatible:
-        names = [f"{a['agent_name']}({a['reason']})" for a in agents_incompatible]
-        log_event(f"[ProximityBroadcast] 🧭 Skipping {len(agents_incompatible)} agents with incompatible direction for {task.restaurant_name}: {names}")
-    
-    if not agents_compatible:
-        log_event(f"[ProximityBroadcast] ⚠️ All agents have incompatible directions for {task.restaurant_name} (bearing {round(task_bearing)}°)")
-        return {'success': False, 'error': 'All agents have incompatible directions (current tasks or pending)', 'task_bearing': round(task_bearing), 'agents_incompatible': agents_incompatible, 'radius_km': search_radius}
-    
-    # Filter out agents who already declined this task (Tookan won't push to them)
-    agents_not_declined = []
-    agents_declined = []
-    for agent_info in agents_compatible:
-        agent = agent_info['agent']
-        if str(agent.id) in task_declined_by:
-            agents_declined.append({
-                'agent_id': agent.id,
-                'agent_name': agent.name
-            })
-        else:
-            agents_not_declined.append(agent_info)
-    
-    if agents_declined:
-        names = [a['agent_name'] for a in agents_declined]
-        log_event(f"[ProximityBroadcast] 🚫 Skipping {len(agents_declined)} agents who declined {task.restaurant_name}: {names}")
-    
-    if not agents_not_declined:
-        log_event(f"[ProximityBroadcast] ⚠️ All nearby agents have declined {task.restaurant_name} - needs manual assignment")
-        return {
-            'success': False, 
-            'error': 'All nearby agents have declined this task',
-            'declined_by': list(task_declined_by),
-            'radius_km': search_radius,
-            'blocked': True,
-            'blocked_reason': 'all_declined'
-        }
-    
-    # Time every legal stop order. Drive time sets the arrivals. An agent is
-    # eligible when the least-late order does not make a delivery excessively late.
+            log_event(f"[ProximityBroadcast] ⭐ PREMIUM FALLBACK: No P1 agents available for {task.restaurant_name}, allowing regular agents")
+
     feasible_agents = []
     infeasible_agents = []
-    
-    for agent_info in agents_not_declined:
-        agent = agent_info['agent']
-        pending_count = len([
-            pending_id for pending_id in get_agent_pending_tasks(agent.id)
-            if str(pending_id) != task_id
-        ])
-        if pending_count > 0:
-            log_event(f"[ProximityBroadcast] 🔄 Including {pending_count} pending tasks in feasibility check for {agent.name}")
-
-        try:
-            evaluation = _evaluate_new_tasks_for_agent(agent, [task])
-            selected = {str(task_id) for task_id in evaluation.get('selected_task_ids') or []}
-            if evaluation.get('feasible') and str(task.id) in selected:
-                eta_info = evaluation.get('stops') or []
-                feasible_agents.append({
-                    'agent_id': agent.id,
-                    'agent_name': agent.name,
-                    'distance_km': round(agent_info['distance_km'], 2),
-                    'location': [agent.current_location.lat, agent.current_location.lng] if agent.current_location else None,
-                    'current_task_count': len(agent.current_tasks),
-                    'available_capacity': agent.available_capacity,
-                    'priority': agent.priority,
-                    'solver_verified': True,
-                    'eta_stops': eta_info,
-                    'has_route': bool(eta_info),
-                    'score': evaluation.get('score'),
-                    'delivery_lateness_minutes': evaluation.get('delivery_lateness_minutes'),
-                })
-            else:
-                infeasible_agents.append({
-                    'agent_id': agent.id,
-                    'agent_name': agent.name,
-                    'reason': evaluation.get('reason') or 'excessive_delivery_lateness'
-                })
-        except Exception as e:
-            infeasible_agents.append({
-                'agent_id': agent.id,
-                'agent_name': agent.name,
-                'reason': f'solver_error: {str(e)}'
-            })
-    
-    if feasible_agents:
-        route_blocked = []
-        route_allowed = []
-        for agent in feasible_agents:
-            is_allowed, reason = is_multi_offer_allowed_with_route(agent.get('has_route', True), agent['agent_id'])
-            if is_allowed:
-                route_allowed.append(agent)
-            else:
-                route_blocked.append({
-                    'agent_id': agent['agent_id'],
-                    'agent_name': agent['agent_name'],
-                    'reason': reason
-                })
-        
-        if route_blocked:
-            names = [f"{a['agent_name']}({a['reason']})" for a in route_blocked]
-            log_event(f"[ProximityBroadcast] 🛑 Skipping {len(route_blocked)} agents due to missing route multi-offer guard for {task.restaurant_name}: {names}")
-        
-        feasible_agents = route_allowed
-    
+    failure = None
+    for group_index, candidate_group in enumerate(candidate_groups):
+        if group_index > 0:
+            log_event(
+                f"[ProximityBroadcast] ⭐ PREMIUM FALLBACK: P1 agents did not meet direction, decline, "
+                f"or delivery-lateness requirements for {task.restaurant_name}. Trying regular agents."
+            )
+        feasible_agents, group_infeasible, failure = _qualify_broadcast_candidates(
+            candidate_group, task, task_declined_by, search_radius
+        )
+        infeasible_agents.extend(group_infeasible)
+        if feasible_agents:
+            break
     if not feasible_agents:
-        log_event(f"[ProximityBroadcast] ⚠️ No feasible agents for {task.restaurant_name} (solver rejected all)")
-        return {
-            'success': False, 
-            'error': 'No feasible agents (excessive delivery lateness)', 
-            'infeasible': infeasible_agents
+        return failure or {
+            'success': False,
+            'error': 'No feasible agents (excessive delivery lateness)',
+            'infeasible': infeasible_agents,
+            'radius_km': search_radius
         }
     
     # Check if we should skip broadcast (same agents, not forced)
@@ -1623,7 +1665,7 @@ def trigger_proximity_broadcast(
     is_first_broadcast = not previous_agents
     task_in_idle_priority = _is_task_in_idle_priority(task_id)
 
-    if task_in_idle_priority and force:
+    if task_in_idle_priority and advance_priority_rollout:
         # Forced rebroadcast while rollout is active -> widen to next priority tier.
         with _proximity_lock:
             entry = _idle_priority_tasks.get(task_id, {})
@@ -1986,47 +2028,67 @@ def trigger_batched_proximity_broadcast(
     if not valid_tasks:
         return {'success': False, 'error': 'No valid tasks (all at broadcast limit)'}
     
-    # PREMIUM EXCLUSIVITY: Regular agents don't get premium tasks when P1 agents are available
-    # This ensures P1 agents don't "share" their premium orders with regular agents
+    # PREMIUM EXCLUSIVITY: A regular agent misses a premium task only while a
+    # priority-1 agent can still take that task. A P1 who fails direction or
+    # has declined it does not keep the task away from everyone else.
     is_p1_agent = agent.priority == 1
     if not is_p1_agent:
-        # Regular agent - check if we should exclude premium tasks
         premium_tasks = [t for t in valid_tasks if t.is_premium_task]
         if premium_tasks:
             all_agents = fleet_state.get_all_agents()
-            # Check if P1 agents are online with capacity
-            p1_agents_available = [
-                a for a in all_agents 
-                if a.priority == 1 and a.is_online and a.has_capacity and a.id != agent_id
+            p1_agents_online = [
+                a for a in all_agents
+                if a.priority == 1 and a.is_online and a.id != agent_id
             ]
-            # Also check if any P1 agent already has these premium tasks pending
-            # (they may be at capacity BECAUSE of these pending tasks)
-            p1_agents_with_pending = []
-            if not p1_agents_available:
-                for a in all_agents:
-                    if a.priority == 1 and a.is_online and a.id != agent_id:
-                        pending = get_agent_pending_tasks(a.id)
-                        held_tasks = [t for t in premium_tasks if t.id in pending]
-                        if held_tasks:
-                            p1_agents_with_pending.append((a, held_tasks))
-            
-            if p1_agents_available:
-                # P1 agents available with capacity - exclude premium tasks from this regular agent
-                premium_names = [t.restaurant_name for t in premium_tasks]
-                p1_names = [a.name for a in p1_agents_available]
-                log_event(f"[ProximityBroadcast] ⭐ PREMIUM EXCLUSIVE (Batched): Excluding premium tasks from {agent_name}: {premium_names}. Reserved for P1: {p1_names}")
-                valid_tasks = [t for t in valid_tasks if not t.is_premium_task]
-            elif p1_agents_with_pending:
-                # P1 agents at capacity but already have these tasks pending — don't leak
-                held_names = [t.restaurant_name for a, tasks in p1_agents_with_pending for t in tasks]
-                p1_names = [a.name for a, _ in p1_agents_with_pending]
-                log_event(f"[ProximityBroadcast] ⭐ PREMIUM HELD (Batched): {held_names} already pending for P1 {p1_names}. Excluding from {agent_name}.")
-                held_task_ids = {t.id for _, tasks in p1_agents_with_pending for t in tasks}
-                valid_tasks = [t for t in valid_tasks if t.id not in held_task_ids]
-            else:
-                # No P1 agents available at all - allow regular agent to take premium tasks
-                premium_names = [t.restaurant_name for t in premium_tasks]
-                log_event(f"[ProximityBroadcast] ⭐ PREMIUM FALLBACK (Batched): No P1 agents available, {agent_name} can take premium tasks: {premium_names}")
+            reserved_task_ids = set()
+            reserved_details = []
+            held_task_ids = set()
+            held_details = []
+            released_names = []
+            for premium_task in premium_tasks:
+                declined_by = {str(agent_id) for agent_id in (premium_task.declined_by or [])}
+                qualified_p1 = [
+                    p1_agent for p1_agent in p1_agents_online
+                    if p1_agent.has_capacity
+                    and str(p1_agent.id) not in declined_by
+                    and _agent_meets_direction_for_task(p1_agent.id, premium_task)
+                ]
+                if qualified_p1:
+                    reserved_task_ids.add(premium_task.id)
+                    reserved_details.append(
+                        f"{premium_task.restaurant_name} ({', '.join(p1_agent.name for p1_agent in qualified_p1)})"
+                    )
+                    continue
+                holders = []
+                for p1_agent in p1_agents_online:
+                    pending = {str(pending_id) for pending_id in get_agent_pending_tasks(p1_agent.id)}
+                    if str(premium_task.id) in pending:
+                        holders.append(p1_agent)
+                if holders:
+                    held_task_ids.add(premium_task.id)
+                    held_details.append(
+                        f"{premium_task.restaurant_name} ({', '.join(p1_agent.name for p1_agent in holders)})"
+                    )
+                else:
+                    released_names.append(premium_task.restaurant_name)
+
+            if reserved_details:
+                log_event(
+                    f"[ProximityBroadcast] ⭐ PREMIUM EXCLUSIVE (Batched): Excluding premium tasks from {agent_name}: "
+                    f"{reserved_details}"
+                )
+            if held_details:
+                log_event(
+                    f"[ProximityBroadcast] ⭐ PREMIUM HELD (Batched): {held_details} already pending for P1. "
+                    f"Excluding from {agent_name}."
+                )
+            if released_names:
+                log_event(
+                    f"[ProximityBroadcast] ⭐ PREMIUM FALLBACK (Batched): No qualified P1 agent for {released_names}. "
+                    f"{agent_name} can be considered."
+                )
+            blocked_ids = reserved_task_ids | held_task_ids
+            valid_tasks = [t for t in valid_tasks if t.id not in blocked_ids]
     
     if not valid_tasks:
         return {'success': False, 'error': 'No valid tasks (premium tasks reserved for P1 agents)'}
@@ -2470,18 +2532,26 @@ def expand_task_radius(task_id: str, new_radius_km: float, dashboard_url: str) -
     # Cap at max radius
     new_radius_km = min(new_radius_km, PROXIMITY_MAX_RADIUS_KM)
     
-    # Store expanded radius in app.py tracking
+    # Store expanded radius in app.py tracking. A P2+ hold keeps its current
+    # offer; the stored radius is used when the priority timer broadcasts next.
+    priority_hold_active = _is_task_in_idle_priority(task_id)
     with _proximity_lock:
         old_radius = _task_expanded_radius.get(task_id, PROXIMITY_DEFAULT_RADIUS_KM)
         _task_expanded_radius[task_id] = new_radius_km
-        
-        # Reset timer for this task
-        _task_offer_times[task_id] = time.time()
+        if not priority_hold_active:
+            _task_offer_times[task_id] = time.time()
     
     # CRITICAL: Also update FleetState so proximity triggers use expanded radius
     if FLEET_STATE_AVAILABLE and fleet_state:
         fleet_state.set_task_expanded_radius(task_id, new_radius_km)
     
+    if priority_hold_active:
+        log_event(
+            f"[ProximityBroadcast] 📏 Stored radius for task {task_id}: {old_radius}km → {new_radius_km}km "
+            f"without rebroadcasting; idle-priority hold is still active"
+        )
+        return {'success': True, 'idle_priority_active': True, 'radius_km': new_radius_km}
+
     # Clear this task from ALL agents' pending broadcasts before re-broadcasting
     # This frees up their broadcast capacity for the expanded search
     clear_task_from_all_pending(task_id)
@@ -4406,7 +4476,8 @@ def handle_proximity_timeout(data):
         task_id=task_id,
         triggered_by_agent="timeout",
         dashboard_url=dashboard_url,
-        force=True
+        force=True,
+        advance_priority_rollout=True
     )
     
     # Emit result
