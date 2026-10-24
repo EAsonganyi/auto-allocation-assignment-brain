@@ -1790,6 +1790,7 @@ def trigger_proximity_broadcast(
                 log_event(f"[ProximityBroadcast] ⏭️ Duplicate broadcast suppressed for {task.restaurant_name} (same agents within debounce)")
                 return {'success': True, 'debounced': True}
 
+    task_bearing = get_task_delivery_bearing(task)
     reservation_requests = [
         {
             'agent_id': agent['agent_id'],
