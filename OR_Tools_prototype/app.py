@@ -684,22 +684,23 @@ def trigger_perceived_projected_check(agent_id: str, broadcast_task_id: str, das
         compatible_tasks = []
         
         for task, dist in tasks_near_perceived:
-            task_bearing = get_task_delivery_bearing(task)
-            diff = angular_difference(broadcast_bearing, task_bearing)
-            
-            if diff <= PROXIMITY_BATCH_DIRECTION_TOLERANCE_DEGREES:
-                # Check per-task broadcast limit
-                bcast_count = get_task_broadcast_count_for_agent(task.id, agent_id)
-                if bcast_count < PROXIMITY_MAX_BROADCASTS_PER_AGENT:
-                    eligibility = fleet_state._check_eligibility(
-                        agent, task, override_max_distance_km=search_radius
-                    )
-                    if eligibility is not None:
-                        continue
-                    compatible_tasks.append(task)
-                    # Limit to remaining capacity
-                    if len(compatible_tasks) >= broadcast_capacity:
-                        break
+            if PROXIMITY_DIRECTION_FILTER_ENABLED:
+                task_bearing = get_task_delivery_bearing(task)
+                diff = angular_difference(broadcast_bearing, task_bearing)
+                if diff > PROXIMITY_BATCH_DIRECTION_TOLERANCE_DEGREES:
+                    continue
+            # Check per-task broadcast limit
+            bcast_count = get_task_broadcast_count_for_agent(task.id, agent_id)
+            if bcast_count < PROXIMITY_MAX_BROADCASTS_PER_AGENT:
+                eligibility = fleet_state._check_eligibility(
+                    agent, task, override_max_distance_km=search_radius
+                )
+                if eligibility is not None:
+                    continue
+                compatible_tasks.append(task)
+                # Limit to remaining capacity
+                if len(compatible_tasks) >= broadcast_capacity:
+                    break
         
         if not compatible_tasks:
             return  # No compatible tasks found
@@ -1052,6 +1053,7 @@ PROXIMITY_MAX_RADIUS_KM = 10.0  # Maximum expanded radius
 PROXIMITY_MAX_BROADCASTS_PER_AGENT = 3  # Max times a task can be broadcast to the same agent
 PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT = 0  # 0 until the dashboard sends Min Auto-Assign Score
 PROXIMITY_BATCH_DIRECTION_TOLERANCE_DEGREES = 90  # Max angular difference for tasks to be batched together
+PROXIMITY_DIRECTION_FILTER_ENABLED = False  # Off by default. The solver decides headings unless the debugger turns this on.
 
 
 def _is_below_min_auto_assign_score(entry: dict) -> bool:
@@ -1250,6 +1252,8 @@ def _evaluate_new_tasks_for_agent(agent, new_tasks) -> dict:
 
 def _agent_meets_direction_for_task(agent_id: str, task) -> bool:
     """True when this task's delivery does not fight the agent's current route."""
+    if not PROXIMITY_DIRECTION_FILTER_ENABLED:
+        return True
     task_bearing = get_task_delivery_bearing(task)
     skip_direction = (
         getattr(task, 'job_type', 'PAIRED') == 'DELIVERY'
@@ -2226,8 +2230,9 @@ def trigger_batched_proximity_broadcast(
     if not valid_tasks:
         return {'success': False, 'error': 'No valid tasks (premium tasks reserved for P1 agents)'}
     
-    # Apply directional filtering - only batch tasks going in similar directions
-    if len(valid_tasks) > 1:
+    # Apply directional filtering - only batch tasks going in similar directions.
+    # When the debugger turns this off, the solver accepts or rejects the route.
+    if PROXIMITY_DIRECTION_FILTER_ENABLED and len(valid_tasks) > 1:
         pre_filter_count = len(valid_tasks)
         valid_tasks = filter_directionally_complementary_tasks(valid_tasks)
         if len(valid_tasks) < pre_filter_count:
@@ -2239,8 +2244,12 @@ def trigger_batched_proximity_broadcast(
     # Check if batch direction is compatible with agent's existing pending broadcasts
     # Use the first task's bearing as the batch direction
     primary_task = valid_tasks[0]
-    batch_bearing = get_task_delivery_bearing(primary_task)
-    is_compatible, reason = is_task_directionally_compatible_with_pending(batch_bearing, agent_id, new_task=primary_task)
+    if PROXIMITY_DIRECTION_FILTER_ENABLED:
+        batch_bearing = get_task_delivery_bearing(primary_task)
+        is_compatible, reason = is_task_directionally_compatible_with_pending(batch_bearing, agent_id, new_task=primary_task)
+    else:
+        batch_bearing = None
+        is_compatible, reason = True, None
     
     if not is_compatible:
         log_event(f"[ProximityBroadcast] 🧭 Batched: {agent_name} has current/pending tasks in different direction. {primary_task.restaurant_name} {reason}")
@@ -2616,15 +2625,22 @@ def trigger_batched_proximity_broadcast(
         }
 
 
+def _settings_flag(value) -> bool:
+    """Parse a dashboard boolean. The string "false" must stay false."""
+    if isinstance(value, str):
+        return value.strip().lower() in ('1', 'true', 'yes', 'on')
+    return bool(value)
+
+
 def update_proximity_broadcast_settings(settings: dict):
     """
     Update proximity broadcast settings from dashboard.
     Called during fleet:sync or config update.
     """
-    global PROXIMITY_BROADCAST_ENABLED, PROXIMITY_TASK_TIMEOUT_SECONDS, PROXIMITY_DEFAULT_RADIUS_KM, PROXIMITY_MAX_BROADCASTS_PER_AGENT, PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT
+    global PROXIMITY_BROADCAST_ENABLED, PROXIMITY_TASK_TIMEOUT_SECONDS, PROXIMITY_DEFAULT_RADIUS_KM, PROXIMITY_MAX_BROADCASTS_PER_AGENT, PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT, PROXIMITY_DIRECTION_FILTER_ENABLED
     
     if 'proximity_broadcast_enabled' in settings:
-        PROXIMITY_BROADCAST_ENABLED = bool(settings['proximity_broadcast_enabled'])
+        PROXIMITY_BROADCAST_ENABLED = _settings_flag(settings['proximity_broadcast_enabled'])
         log_event(f"[ProximityBroadcast] Mode {'ENABLED' if PROXIMITY_BROADCAST_ENABLED else 'DISABLED'}")
     
     if 'proximity_task_timeout_seconds' in settings:
@@ -2646,6 +2662,14 @@ def update_proximity_broadcast_settings(settings: dict):
             score_threshold = 0
         PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT = max(0, min(100, score_threshold))
         log_event(f"[ProximityBroadcast] Min auto-assign score set to {PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT}%")
+
+    if 'proximity_direction_filter_enabled' in settings:
+        PROXIMITY_DIRECTION_FILTER_ENABLED = _settings_flag(settings['proximity_direction_filter_enabled'])
+        log_event(
+            f"[ProximityBroadcast] Direction filter "
+            f"{'ENABLED' if PROXIMITY_DIRECTION_FILTER_ENABLED else 'DISABLED'} "
+            f"(solver decides headings when off)"
+        )
 
 
 def expand_task_radius(task_id: str, new_radius_km: float, dashboard_url: str) -> dict:
@@ -3688,17 +3712,20 @@ def handle_fleet_sync(data):
                         log_event(f"[FleetState] → direction_coherence_mode: {old_mode} → {mode} (from fleet:sync)")
             
             # Proximity broadcast settings - ONLY update timeout/radius/limit, NOT the mode
-            # Mode should only change via explicit config:update to prevent sync from resetting user's toggle
+            # Mode and the direction-filter toggle should only change via explicit
+            # config:update so a fleet sync cannot reset the debugger toggles.
             proximity_config_keys = ['proximity_task_timeout_seconds', 'proximity_default_radius_km', 'proximity_max_broadcasts_per_agent']
             if any(k in config for k in proximity_config_keys):
-                # Filter out proximity_broadcast_enabled to preserve current mode during sync
-                safe_config = {k: v for k, v in config.items() if k != 'proximity_broadcast_enabled'}
+                safe_config = {
+                    k: v for k, v in config.items()
+                    if k not in ('proximity_broadcast_enabled', 'proximity_direction_filter_enabled')
+                }
                 if safe_config:
                     update_proximity_broadcast_settings(safe_config)
             if 'min_auto_assign_score_percent' not in config and PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT != 0:
                 update_proximity_broadcast_settings({'min_auto_assign_score_percent': 0})
             if any(k in config for k in proximity_config_keys) or 'min_auto_assign_score_percent' in config:
-                print(f"[FleetState] → proximity_broadcast = {'ENABLED' if PROXIMITY_BROADCAST_ENABLED else 'DISABLED'} (preserved), timeout = {PROXIMITY_TASK_TIMEOUT_SECONDS}s, maxBcast = {PROXIMITY_MAX_BROADCASTS_PER_AGENT}, minScore = {PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT}%")
+                print(f"[FleetState] → proximity_broadcast = {'ENABLED' if PROXIMITY_BROADCAST_ENABLED else 'DISABLED'} (preserved), timeout = {PROXIMITY_TASK_TIMEOUT_SECONDS}s, maxBcast = {PROXIMITY_MAX_BROADCASTS_PER_AGENT}, minScore = {PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT}%, directionFilter = {'ON' if PROXIMITY_DIRECTION_FILTER_ENABLED else 'OFF'} (preserved)")
             
             print(f"[FleetState] Applied config: max_dist={fleet_state.max_distance_km}km, chain_lookahead={fleet_state.chain_lookahead_radius_km}km, capacity={fleet_state.default_max_capacity}, wallet={fleet_state.wallet_threshold}")
         
@@ -3741,6 +3768,7 @@ def handle_fleet_sync(data):
                 'proximity_task_timeout_seconds': PROXIMITY_TASK_TIMEOUT_SECONDS,
                 'proximity_max_broadcasts_per_agent': PROXIMITY_MAX_BROADCASTS_PER_AGENT,
                 'min_auto_assign_score_percent': PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT,
+                'proximity_direction_filter_enabled': PROXIMITY_DIRECTION_FILTER_ENABLED,
                 'merchant_agent_exclusions': {
                     merchant: list(agent_ids)
                     for merchant, agent_ids in fleet_state.merchant_agent_exclusions.items()
@@ -3924,6 +3952,15 @@ def handle_config_update(data):
             old_val = PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT
             update_proximity_broadcast_settings({'min_auto_assign_score_percent': 0})
             changes.append(f"min_auto_assign_score_percent: {old_val} → 0")
+
+        if 'proximity_direction_filter_enabled' in config:
+            old_val = PROXIMITY_DIRECTION_FILTER_ENABLED
+            update_proximity_broadcast_settings({
+                'proximity_direction_filter_enabled': config['proximity_direction_filter_enabled']
+            })
+            changes.append(
+                f"proximity_direction_filter_enabled: {old_val} → {PROXIMITY_DIRECTION_FILTER_ENABLED}"
+            )
         
         if 'direction_coherence_mode' in config:
             mode = str(config['direction_coherence_mode']).lower()
@@ -3958,6 +3995,7 @@ def handle_config_update(data):
                 'proximity_default_radius_km': PROXIMITY_DEFAULT_RADIUS_KM,
                 'proximity_max_broadcasts_per_agent': PROXIMITY_MAX_BROADCASTS_PER_AGENT,
                 'min_auto_assign_score_percent': PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT,
+                'proximity_direction_filter_enabled': PROXIMITY_DIRECTION_FILTER_ENABLED,
                 'direction_coherence_mode': fleet_state.direction_coherence_mode,
                 'merchant_agent_exclusions': {
                     merchant: list(agent_ids)
@@ -6319,7 +6357,8 @@ def fleet_state_config():
             'proximity_default_radius_km': PROXIMITY_DEFAULT_RADIUS_KM,
             'proximity_max_radius_km': PROXIMITY_MAX_RADIUS_KM,
             'proximity_max_broadcasts_per_agent': PROXIMITY_MAX_BROADCASTS_PER_AGENT,
-            'min_auto_assign_score_percent': PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT
+            'min_auto_assign_score_percent': PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT,
+            'proximity_direction_filter_enabled': PROXIMITY_DIRECTION_FILTER_ENABLED
         }), 200
     
     # POST - update config
@@ -6363,6 +6402,7 @@ def fleet_state_config():
         'proximity_default_radius_km',
         'proximity_max_broadcasts_per_agent',
         'min_auto_assign_score_percent',
+        'proximity_direction_filter_enabled',
     )):
         update_proximity_broadcast_settings(data)
     
@@ -6381,7 +6421,8 @@ def fleet_state_config():
         'proximity_default_radius_km': PROXIMITY_DEFAULT_RADIUS_KM,
         'proximity_max_radius_km': PROXIMITY_MAX_RADIUS_KM,
         'proximity_max_broadcasts_per_agent': PROXIMITY_MAX_BROADCASTS_PER_AGENT,
-        'min_auto_assign_score_percent': PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT
+        'min_auto_assign_score_percent': PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT,
+        'proximity_direction_filter_enabled': PROXIMITY_DIRECTION_FILTER_ENABLED
     }), 200
 
 

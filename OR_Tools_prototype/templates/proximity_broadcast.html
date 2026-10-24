@@ -417,6 +417,7 @@
         <h1>📡 Proximity Broadcast Debug</h1>
         <div style="display: flex; gap: 12px; align-items: center;">
             <span class="status-badge" id="modeBadge">LOADING</span>
+            <span class="status-badge solver" id="directionFilterBadge" title="Hard heading check before the solver">🧭 FILTER OFF</span>
             <span class="status-badge" id="coherenceBadge" title="Direction coherence mode">🧭 LOADING</span>
             <span class="status-badge" id="connectionBadge">Connecting...</span>
             <button class="btn btn-primary" onclick="requestSync()" title="Request full state sync from main dashboard">🔄 Sync</button>
@@ -537,9 +538,16 @@
             </div>
             <div class="config-item">
                 <label>Direction Coherence</label>
-                <select id="coherenceSelect" title="How opposing delivery directions are handled">
+                <select id="coherenceSelect" title="How opposing delivery directions are handled inside the solver">
                     <option value="prefilter">Pre-Filter (Hard Block)</option>
                     <option value="solver">Solver Penalty (Soft)</option>
+                </select>
+            </div>
+            <div class="config-item">
+                <label>Broadcast Direction Filter</label>
+                <select id="directionFilterSelect" title="Skip an agent before the solver when their current job heads more than 90° away. Off lets the solver decide.">
+                    <option value="false" selected>Off (solver decides)</option>
+                    <option value="true">On (block opposite headings)</option>
                 </select>
             </div>
             <div class="config-item" style="justify-content: flex-end;">
@@ -573,6 +581,7 @@
         let defaultRadius = 3.0;
         let maxBroadcastsPerAgent = 3;
         let directionCoherenceMode = 'prefilter';
+        let directionFilterEnabled = false;
         let agentCounts = { online: 0, count: 0 };
         
         // Stale data detection
@@ -610,6 +619,7 @@
                 defaultRadius = config.proximity_default_radius_km || 3.0;
                 maxBroadcastsPerAgent = config.proximity_max_broadcasts_per_agent || 3;
                 directionCoherenceMode = config.direction_coherence_mode || 'prefilter';
+                directionFilterEnabled = config.proximity_direction_filter_enabled === true;
                 
                 // Check health for stale data warning (event-driven, so only warn if no events for 5+ min)
                 const health = await healthRes.json();
@@ -990,8 +1000,11 @@
                 defaultRadius = data.config_applied.proximity_default_radius_km ?? defaultRadius;
                 maxBroadcastsPerAgent = data.config_applied.proximity_max_broadcasts_per_agent ?? maxBroadcastsPerAgent;
                 directionCoherenceMode = data.config_applied.direction_coherence_mode ?? directionCoherenceMode;
+                if (data.config_applied.proximity_direction_filter_enabled !== undefined) {
+                    directionFilterEnabled = !!data.config_applied.proximity_direction_filter_enabled;
+                }
                 updateSettingsUI();
-                addLog('success', `✅ Settings updated: mode=${broadcastEnabled ? 'BROADCAST' : 'AUTO'}, coherence=${directionCoherenceMode}, timeout=${taskTimeout}s, radius=${defaultRadius}km, maxBcast=${maxBroadcastsPerAgent}`);
+                addLog('success', `✅ Settings updated: mode=${broadcastEnabled ? 'BROADCAST' : 'AUTO'}, directionFilter=${directionFilterEnabled ? 'ON' : 'OFF'}, coherence=${directionCoherenceMode}, timeout=${taskTimeout}s, radius=${defaultRadius}km, maxBcast=${maxBroadcastsPerAgent}`);
             } else if (!data.success) {
                 addLog('error', `❌ Settings update failed: ${data.error}`);
             }
@@ -1418,6 +1431,9 @@
             document.getElementById('coherenceBadge').textContent = coherenceLabel;
             document.getElementById('coherenceBadge').className = 'status-badge ' + directionCoherenceMode;
             document.getElementById('coherenceSelect').value = directionCoherenceMode;
+            document.getElementById('directionFilterBadge').textContent = directionFilterEnabled ? '🧭 FILTER ON' : '🧭 FILTER OFF';
+            document.getElementById('directionFilterBadge').className = 'status-badge ' + (directionFilterEnabled ? 'prefilter' : 'solver');
+            document.getElementById('directionFilterSelect').value = directionFilterEnabled ? 'true' : 'false';
         }
         
         function applySettings() {
@@ -1427,7 +1443,8 @@
                     proximity_task_timeout_seconds: parseInt(document.getElementById('timeoutInput').value),
                     proximity_default_radius_km: parseFloat(document.getElementById('radiusInput').value),
                     proximity_max_broadcasts_per_agent: parseInt(document.getElementById('maxBroadcastsInput').value),
-                    direction_coherence_mode: document.getElementById('coherenceSelect').value
+                    direction_coherence_mode: document.getElementById('coherenceSelect').value,
+                    proximity_direction_filter_enabled: document.getElementById('directionFilterSelect').value === 'true'
                 },
                 dashboard_url: window.location.origin
             });
