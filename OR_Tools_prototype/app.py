@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import uuid
 import threading
 import logging
@@ -993,7 +993,22 @@ PROXIMITY_TASK_TIMEOUT_SECONDS = 120  # How long before task re-broadcasts (defa
 PROXIMITY_DEFAULT_RADIUS_KM = 3.0  # Default search radius
 PROXIMITY_MAX_RADIUS_KM = 10.0  # Maximum expanded radius
 PROXIMITY_MAX_BROADCASTS_PER_AGENT = 3  # Max times a task can be broadcast to the same agent
+PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT = 0  # 0 until the dashboard sends Min Auto-Assign Score
 PROXIMITY_BATCH_DIRECTION_TOLERANCE_DEGREES = 90  # Max angular difference for tasks to be batched together
+
+
+def _is_below_min_auto_assign_score(entry: dict) -> bool:
+    """True when a computed score is under the dashboard threshold. Missing scores are kept."""
+    threshold = int(PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT or 0)
+    if threshold <= 0:
+        return False
+    score = entry.get('score')
+    if score is None:
+        return False
+    try:
+        return float(score) < threshold
+    except (TypeError, ValueError):
+        return False
 
 
 import math
@@ -1098,6 +1113,84 @@ def filter_directionally_complementary_tasks(tasks: list, tolerance_degrees: flo
     return complementary
 
 
+def _route_task_payload(task, is_new: bool) -> dict:
+    """Normalize a fleet task into the delivery-lateness route checker."""
+    meta = getattr(task, 'meta', None) or {}
+    restaurant = getattr(task, 'restaurant_name', None) or meta.get('restaurant_name', '')
+    return {
+        'task_id': str(task.id),
+        'is_new': is_new,
+        'job_type': getattr(task, 'job_type', None) or 'PAIRED',
+        'pickup_completed': bool(getattr(task, 'pickup_completed', False)),
+        'pickup_lat': task.restaurant_location.lat,
+        'pickup_lng': task.restaurant_location.lng,
+        'delivery_lat': task.delivery_location.lat,
+        'delivery_lng': task.delivery_location.lng,
+        'pickup_ready': task.pickup_before,
+        'delivery_deadline': task.delivery_before,
+        'label': restaurant,
+    }
+
+
+def _committed_route_tasks(agent, exclude_ids) -> List[dict]:
+    """Current tasks plus pending offers, except the tasks being judged now."""
+    exclude_ids = {str(task_id) for task_id in exclude_ids}
+    payloads = []
+    pending_ids = set()
+    for current in agent.current_tasks:
+        if str(current.id) in exclude_ids:
+            continue
+        payloads.append(_route_task_payload(current, False))
+    for pending_id in get_agent_pending_tasks(agent.id):
+        pending_key = str(pending_id)
+        if pending_key in exclude_ids or pending_key in pending_ids:
+            continue
+        pending_ids.add(pending_key)
+        pending = fleet_state.get_task(pending_key) if fleet_state else None
+        if pending is not None:
+            payloads.append(_route_task_payload(pending, False))
+    return payloads
+
+
+def _lateness_cutoff_minutes(config: dict):
+    """Grace Period from the dashboard is the combined delivery-lateness budget."""
+    if not isinstance(config, dict):
+        return None
+    if config.get('grace_period_minutes') is not None:
+        return int(config['grace_period_minutes'])
+    if config.get('max_lateness_minutes') is not None:
+        return int(config['max_lateness_minutes'])
+    return None
+
+
+def _evaluate_new_tasks_for_agent(agent, new_tasks) -> dict:
+    """Score one agent by the least-late delivery order for these new tasks."""
+    origin = getattr(agent, 'current_location', None)
+    if origin is None or origin.lat is None or origin.lng is None:
+        return {
+            'feasible': False,
+            'selected_task_ids': [],
+            'score': None,
+            'delivery_lateness_minutes': None,
+            'stops': [],
+            'reason': 'no_location',
+        }
+    max_lateness = 45
+    if fleet_state is not None:
+        try:
+            max_lateness = int(getattr(fleet_state, 'max_lateness_minutes', 45) or 45)
+        except (TypeError, ValueError):
+            max_lateness = 45
+    return choose_delivery_tasks(
+        origin_lat=origin.lat,
+        origin_lng=origin.lng,
+        committed=_committed_route_tasks(agent, [task.id for task in new_tasks]),
+        candidates=[_route_task_payload(task, True) for task in new_tasks],
+        now=datetime.now(timezone.utc),
+        max_lateness_minutes=max_lateness,
+    )
+
+
 def trigger_proximity_broadcast(
     task_id: str,
     triggered_by_agent: str,
@@ -1110,8 +1203,9 @@ def trigger_proximity_broadcast(
     
     Instead of assigning to one agent, this:
     1. Finds all agents near the task (using both current and projected locations)
-    2. Runs the solver to verify time feasibility for each agent
-    3. Broadcasts task:proximity to all FEASIBLE agents
+    2. Times every legal stop order and keeps agents whose least-late order
+       does not make a delivery excessively late
+    3. Broadcasts task:proximity to those agents, scored from delivery lateness
     
     OPTIMIZATION: Only broadcasts if:
     - force=True (timeout, expand, decline events)
@@ -1418,112 +1512,25 @@ def trigger_proximity_broadcast(
             'blocked_reason': 'all_declined'
         }
     
-    # Run solver for single task with agents who haven't declined
+    # Time every legal stop order. Drive time sets the arrivals. An agent is
+    # eligible when the least-late order does not make a delivery excessively late.
     feasible_agents = []
     infeasible_agents = []
     
     for agent_info in agents_not_declined:
         agent = agent_info['agent']
-        
-        # Build single-agent data for solver
-        # Include BOTH current tasks AND pending broadcasts to check true feasibility
-        current_tasks = []
-        
-        # Add agent's actual current tasks
-        for ct in agent.current_tasks:
-            current_tasks.append({
-                'id': ct.id,
-                'job_type': ct.job_type,
-                'restaurant_location': [ct.restaurant_location.lat, ct.restaurant_location.lng],
-                'delivery_location': [ct.delivery_location.lat, ct.delivery_location.lng],
-                'pickup_before': ct.pickup_before.isoformat() if ct.pickup_before else None,
-                'delivery_before': ct.delivery_before.isoformat() if ct.delivery_before else None,
-                'assigned_driver': agent.id,
-                'pickup_completed': ct.pickup_completed,
-                '_meta': ct.meta
-            })
-        
-        # Add pending broadcasts as "virtual" current tasks for feasibility check
-        # This ensures we check if new task can be done AFTER all pending tasks
-        pending_task_ids = get_agent_pending_tasks(agent.id)
-        pending_count = 0
-        for pending_id in pending_task_ids:
-            pending_task = fleet_state.get_task(pending_id)
-            if pending_task and pending_task.id != task_id:  # Don't include the task we're checking
-                current_tasks.append({
-                    'id': pending_task.id,
-                    'job_type': pending_task.job_type,
-                    'restaurant_location': [pending_task.restaurant_location.lat, pending_task.restaurant_location.lng],
-                    'delivery_location': [pending_task.delivery_location.lat, pending_task.delivery_location.lng],
-                    'pickup_before': pending_task.pickup_before.isoformat() if pending_task.pickup_before else None,
-                    'delivery_before': pending_task.delivery_before.isoformat() if pending_task.delivery_before else None,
-                    'assigned_driver': agent.id,
-                    'pickup_completed': False,  # Pending tasks haven't started pickup
-                    '_meta': pending_task.meta
-                })
-                pending_count += 1
-        
+        pending_count = len([
+            pending_id for pending_id in get_agent_pending_tasks(agent.id)
+            if str(pending_id) != task_id
+        ])
         if pending_count > 0:
             log_event(f"[ProximityBroadcast] 🔄 Including {pending_count} pending tasks in feasibility check for {agent.name}")
-        
-        agents_data = {
-            'agents': [{
-                'driver_id': agent.id,
-                'name': agent.name,
-                'current_location': [agent.current_location.lat, agent.current_location.lng],
-                'current_tasks': current_tasks,
-                'wallet_balance': agent.wallet_balance,
-                '_meta': {
-                    'max_tasks': agent.max_capacity,
-                    'available_capacity': agent.available_capacity,
-                    'tags': agent.tags,
-                    'priority': agent.priority
-                }
-            }],
-            'online_agent_ids': _export_online_agent_ids(),
-            'geofence_data': _export_geofence_data(),
-            'settings_used': {
-                'walletNoCashThreshold': fleet_state.wallet_threshold,
-                'maxDistanceKm': search_radius,  # Use current search radius
-                'premiumTipThreshold': fleet_state.premium_tip_threshold,
-                'premiumDeliveryFeeThreshold': fleet_state.premium_delivery_fee_threshold
-            }
-        }
-        
-        # Get just this one task
-        # Convert payment_method to payment_type for optimizer (NoCash filtering)
-        payment_type = "CASH" if task.payment_method.lower() == "cash" else "CARD"
-        
-        task_export = {
-            'tasks': [{
-                'id': task.id,
-                'restaurant_location': [task.restaurant_location.lat, task.restaurant_location.lng],
-                'delivery_location': [task.delivery_location.lat, task.delivery_location.lng],
-                'pickup_before': task.pickup_before.isoformat() if task.pickup_before else None,
-                'delivery_before': task.delivery_before.isoformat() if task.delivery_before else None,
-                'payment_method': task.payment_method,
-                'tags': task.tags,
-                '_meta': {
-                    'restaurant_name': task.restaurant_name,
-                    'customer_name': task.meta.get('customer_name', 'Unknown'),
-                    'delivery_fee': task.delivery_fee,
-                    'tips': task.tips,
-                    'payment_type': payment_type,  # Required for NoCash tag filtering
-                    'tags': task.tags
-                }
-            }]
-        }
-        
+
         try:
-            # Run solver for this agent + this task
-            dir_mode = getattr(fleet_state, 'direction_coherence_mode', 'prefilter') if fleet_state else 'prefilter'
-            result = optimize_fleet(agents_data, task_export, prefilter_distance=False, direction_coherence_mode=dir_mode)
-            
-            if result.get('success') and result.get('metadata', {}).get('tasks_assigned', 0) > 0:
-                # Solver says this agent can complete the task on time
-                route = result.get('agent_routes', [{}])[0]
-                eta_info = route.get('route') or route.get('stops', [])
-                
+            evaluation = _evaluate_new_tasks_for_agent(agent, [task])
+            selected = {str(task_id) for task_id in evaluation.get('selected_task_ids') or []}
+            if evaluation.get('feasible') and str(task.id) in selected:
+                eta_info = evaluation.get('stops') or []
                 feasible_agents.append({
                     'agent_id': agent.id,
                     'agent_name': agent.name,
@@ -1534,15 +1541,15 @@ def trigger_proximity_broadcast(
                     'priority': agent.priority,
                     'solver_verified': True,
                     'eta_stops': eta_info,
-                    'has_route': bool(eta_info)
+                    'has_route': bool(eta_info),
+                    'score': evaluation.get('score'),
+                    'delivery_lateness_minutes': evaluation.get('delivery_lateness_minutes'),
                 })
             else:
-                # Solver says not feasible
-                reason = result.get('error', 'time_window_infeasible')
                 infeasible_agents.append({
                     'agent_id': agent.id,
                     'agent_name': agent.name,
-                    'reason': reason
+                    'reason': evaluation.get('reason') or 'excessive_delivery_lateness'
                 })
         except Exception as e:
             infeasible_agents.append({
@@ -1575,7 +1582,7 @@ def trigger_proximity_broadcast(
         log_event(f"[ProximityBroadcast] ⚠️ No feasible agents for {task.restaurant_name} (solver rejected all)")
         return {
             'success': False, 
-            'error': 'No feasible agents (time windows)', 
+            'error': 'No feasible agents (excessive delivery lateness)', 
             'infeasible': infeasible_agents
         }
     
@@ -1708,6 +1715,28 @@ def trigger_proximity_broadcast(
             'infeasible': infeasible_agents
         }
 
+    below_score = [agent for agent in feasible_agents if _is_below_min_auto_assign_score(agent)]
+    if below_score:
+        dropped_details = [f"{agent['agent_name']}({agent.get('score')}%)" for agent in below_score]
+        log_event(
+            f"[ProximityBroadcast] 🚫 Score threshold {PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT}% "
+            f"dropped {len(below_score)} agent(s) for {task.restaurant_name}: {dropped_details}"
+        )
+        feasible_agents = [agent for agent in feasible_agents if agent not in below_score]
+
+    if not feasible_agents:
+        log_event(
+            f"[ProximityBroadcast] ⚠️ No feasible agents for {task.restaurant_name} "
+            f"at or above score {PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT}%"
+        )
+        return {
+            'success': False,
+            'error': 'No feasible agents above score threshold',
+            'below_score_threshold': PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT,
+            'infeasible': infeasible_agents,
+            'radius_km': search_radius
+        }
+
     # Extra guard: block identical broadcasts within debounce window (even if forced)
     final_agent_ids = set(str(a['agent_id']) for a in feasible_agents)
     with _proximity_lock:
@@ -1814,7 +1843,9 @@ def trigger_proximity_broadcast(
     for a in feasible_agents:
         pending = len(get_agent_pending_tasks(a['agent_id']))
         bcast_count = get_task_broadcast_count_for_agent(task_id, a['agent_id'])
-        agent_details.append(f"{a['agent_name']}(pending:{pending},bcast:{bcast_count}/{PROXIMITY_MAX_BROADCASTS_PER_AGENT})")
+        agent_details.append(
+            f"{a['agent_name']}(pending:{pending},bcast:{bcast_count}/{PROXIMITY_MAX_BROADCASTS_PER_AGENT},score:{a.get('score', 'n/a')})"
+        )
     
     log_event(f"[ProximityBroadcast] 📡 {task.restaurant_name} → {len(feasible_agents)} agents: {agent_details} (radius: {search_radius}km)")
     
@@ -2053,124 +2084,37 @@ def trigger_batched_proximity_broadcast(
             return {'success': True, 'debounced': True}
         _last_proximity_broadcast[batch_key] = now
     
-    # Build agent data for solver
-    # Include BOTH current tasks AND pending broadcasts (not in this batch) for true feasibility
-    current_tasks = []
-    valid_task_ids = {t.id for t in valid_tasks}  # IDs of tasks we're checking in this batch
-    
-    # Add agent's actual current tasks
-    for ct in agent.current_tasks:
-        current_tasks.append({
-            'id': ct.id,
-            'job_type': ct.job_type,
-            'restaurant_location': [ct.restaurant_location.lat, ct.restaurant_location.lng],
-            'delivery_location': [ct.delivery_location.lat, ct.delivery_location.lng],
-            'pickup_before': ct.pickup_before.isoformat() if ct.pickup_before else None,
-            'delivery_before': ct.delivery_before.isoformat() if ct.delivery_before else None,
-            'assigned_driver': agent.id,
-            'pickup_completed': ct.pickup_completed,
-            '_meta': ct.meta
-        })
-    
-    # Add pending broadcasts (not in current batch) as "virtual" current tasks
-    pending_task_ids = get_agent_pending_tasks(agent_id)
-    pending_count = 0
-    for pending_id in pending_task_ids:
-        if pending_id not in valid_task_ids:  # Don't include tasks we're checking
-            pending_task = fleet_state.get_task(pending_id)
-            if pending_task:
-                current_tasks.append({
-                    'id': pending_task.id,
-                    'job_type': pending_task.job_type,
-                    'restaurant_location': [pending_task.restaurant_location.lat, pending_task.restaurant_location.lng],
-                    'delivery_location': [pending_task.delivery_location.lat, pending_task.delivery_location.lng],
-                    'pickup_before': pending_task.pickup_before.isoformat() if pending_task.pickup_before else None,
-                    'delivery_before': pending_task.delivery_before.isoformat() if pending_task.delivery_before else None,
-                    'assigned_driver': agent.id,
-                    'pickup_completed': False,
-                    '_meta': pending_task.meta
-                })
-                pending_count += 1
-    
-    if pending_count > 0:
-        log_event(f"[ProximityBroadcast] 🔄 Batched: Including {pending_count} pending tasks in feasibility check for {agent_name}")
-    
-    agents_data = {
-        'agents': [{
-            'driver_id': agent.id,
-            'name': agent.name,
-            'current_location': [agent.current_location.lat, agent.current_location.lng],
-            'current_tasks': current_tasks,
-            'wallet_balance': agent.wallet_balance,
-            '_meta': {
-                'max_tasks': agent.max_capacity,
-                'available_capacity': agent.available_capacity,
-                'tags': agent.tags,
-                'priority': agent.priority
-            }
-        }],
-        'online_agent_ids': _export_online_agent_ids(),
-        'geofence_data': _export_geofence_data(),
-        'settings_used': {
-            'walletNoCashThreshold': fleet_state.wallet_threshold,
-            'maxDistanceKm': fleet_state.max_distance_km,
-            'premiumTipThreshold': fleet_state.premium_tip_threshold,
-            'premiumDeliveryFeeThreshold': fleet_state.premium_delivery_fee_threshold
-        }
-    }
-    
-    # Build task data for ALL tasks
-    tasks_export = []
-    for task in valid_tasks:
-        # Get search radius for this task (expanded or default)
-        search_radius = _task_expanded_radius.get(task.id, PROXIMITY_DEFAULT_RADIUS_KM)
-        # Convert payment_method to payment_type for optimizer (NoCash filtering)
-        payment_type = "CASH" if task.payment_method.lower() == "cash" else "CARD"
-        tasks_export.append({
-            'id': task.id,
-            'restaurant_location': [task.restaurant_location.lat, task.restaurant_location.lng],
-            'delivery_location': [task.delivery_location.lat, task.delivery_location.lng],
-            'pickup_before': task.pickup_before.isoformat() if task.pickup_before else None,
-            'delivery_before': task.delivery_before.isoformat() if task.delivery_before else None,
-            'payment_method': task.payment_method,
-            'tags': task.tags,
-            '_meta': {
-                'restaurant_name': task.restaurant_name,
-                'customer_name': task.meta.get('customer_name', 'Unknown'),
-                'delivery_fee': task.delivery_fee,
-                'tips': task.tips,
-                'search_radius_km': search_radius,
-                'payment_type': payment_type,  # Required for NoCash tag filtering
-                'tags': task.tags
-            }
-        })
-    
-    task_export = {'tasks': tasks_export}
-    
+    pending_outside_batch = [
+        pending_id for pending_id in get_agent_pending_tasks(agent_id)
+        if str(pending_id) not in {str(task.id) for task in valid_tasks}
+    ]
+    if pending_outside_batch:
+        log_event(f"[ProximityBroadcast] 🔄 Batched: Including {len(pending_outside_batch)} pending tasks in feasibility check for {agent_name}")
+
     try:
-        # Run solver with ALL tasks at once
-        dir_mode = getattr(fleet_state, 'direction_coherence_mode', 'prefilter') if fleet_state else 'prefilter'
-        result = optimize_fleet(agents_data, task_export, prefilter_distance=False, direction_coherence_mode=dir_mode)
-        
-        if not result.get('success'):
+        evaluation = _evaluate_new_tasks_for_agent(agent, valid_tasks)
+        assigned_task_ids = {str(task_id) for task_id in evaluation.get('selected_task_ids') or []}
+        stops = evaluation.get('stops') or []
+        route_score = evaluation.get('score')
+
+        if not evaluation.get('feasible') or not assigned_task_ids:
+            log_event(
+                f"[ProximityBroadcast] ⚠️ Batched: No feasible tasks for {agent_name} "
+                f"({evaluation.get('reason') or 'excessive_delivery_lateness'})"
+            )
             return {
                 'success': False,
-                'error': result.get('error', 'solver_failed'),
-                'agent_id': agent_id
+                'error': evaluation.get('reason') or 'excessive_delivery_lateness',
+                'agent_id': agent_id,
+                'tasks_checked': len(valid_tasks)
             }
-        
-        # Extract which tasks were assigned by the solver
+
         feasible_tasks = []
         infeasible_task_ids = set(t.id for t in valid_tasks)
-        
-        routes = result.get('agent_routes', [])
-        if routes:
-            route = routes[0]
-            assigned_task_ids = route.get('assigned_new_tasks', [])
-            stops = route.get('route') or route.get('stops', [])
-            
+
+        if stops or assigned_task_ids:
             for task in valid_tasks:
-                if task.id in assigned_task_ids:
+                if str(task.id) in assigned_task_ids:
                     infeasible_task_ids.discard(task.id)
                     
                     # Get search radius for display
@@ -2203,12 +2147,12 @@ def trigger_batched_proximity_broadcast(
                             min_dist = 0
                     
                     # Find ETA from stops
-                    task_stops = [s for s in stops if s.get('task_id') == task.id]
+                    task_stops = [s for s in stops if str(s.get('task_id')) == str(task.id)]
                     
                     # Calculate task bearing for directional tracking
                     task_bearing = get_task_delivery_bearing(task)
                     
-                    feasible_tasks.append({
+                    feasible_task = {
                         'task_id': task.id,
                         'restaurant_name': task.restaurant_name,
                         'customer_name': task.meta.get('customer_name', 'Unknown'),
@@ -2228,8 +2172,12 @@ def trigger_batched_proximity_broadcast(
                         },
                         'eta_stops': task_stops,
                         'bearing': task_bearing,  # Store bearing for directional tracking
-                        'has_route': bool(task_stops)
-                    })
+                        'has_route': bool(stops)
+                    }
+                    if route_score is not None:
+                        feasible_task['score'] = route_score
+                        feasible_task['delivery_lateness_minutes'] = evaluation.get('delivery_lateness_minutes')
+                    feasible_tasks.append(feasible_task)
         
         if not feasible_tasks:
             log_event(f"[ProximityBroadcast] ⚠️ Batched: No feasible tasks for {agent_name} (solver rejected all {len(valid_tasks)})")
@@ -2270,6 +2218,17 @@ def trigger_batched_proximity_broadcast(
                     f"Sending only closest task to {agent_name}: {selected['restaurant_name']}"
                 )
                 feasible_tasks = [selected]
+
+        below_score = [task_info for task_info in feasible_tasks if _is_below_min_auto_assign_score(task_info)]
+        if below_score:
+            dropped_details = [
+                f"{task_info['restaurant_name']}({task_info.get('score')}%)" for task_info in below_score
+            ]
+            log_event(
+                f"[ProximityBroadcast] 🚫 BATCHED score threshold {PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT}% "
+                f"dropped {len(below_score)} task(s) for {agent_name}: {dropped_details}"
+            )
+            feasible_tasks = [task_info for task_info in feasible_tasks if task_info not in below_score]
         
         if feasible_tasks:
             now = time.time()
@@ -2284,6 +2243,18 @@ def trigger_batched_proximity_broadcast(
                         return {'success': True, 'debounced': True}
         
         if not feasible_tasks:
+            if below_score:
+                log_event(
+                    f"[ProximityBroadcast] ⚠️ Batched: No tasks for {agent_name} "
+                    f"at or above score {PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT}%"
+                )
+                return {
+                    'success': False,
+                    'error': 'No feasible tasks above score threshold',
+                    'below_score_threshold': PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT,
+                    'agent_id': agent_id,
+                    'tasks_checked': len(valid_tasks)
+                }
             log_event(f"[ProximityBroadcast] ⚠️ Batched: No feasible tasks for {agent_name} after route guard")
             return {
                 'success': False,
@@ -2402,6 +2373,7 @@ def trigger_batched_proximity_broadcast(
                         'available_capacity': agent.available_capacity,
                         'priority': agent.priority,
                         'solver_verified': True,
+                        'score': task_info.get('score'),
                         'batched_with': len(feasible_tasks) - 1  # Number of OTHER tasks in batch
                     }],
                     'competition': 1,
@@ -2454,7 +2426,7 @@ def update_proximity_broadcast_settings(settings: dict):
     Update proximity broadcast settings from dashboard.
     Called during fleet:sync or config update.
     """
-    global PROXIMITY_BROADCAST_ENABLED, PROXIMITY_TASK_TIMEOUT_SECONDS, PROXIMITY_DEFAULT_RADIUS_KM, PROXIMITY_MAX_BROADCASTS_PER_AGENT
+    global PROXIMITY_BROADCAST_ENABLED, PROXIMITY_TASK_TIMEOUT_SECONDS, PROXIMITY_DEFAULT_RADIUS_KM, PROXIMITY_MAX_BROADCASTS_PER_AGENT, PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT
     
     if 'proximity_broadcast_enabled' in settings:
         PROXIMITY_BROADCAST_ENABLED = bool(settings['proximity_broadcast_enabled'])
@@ -2471,6 +2443,14 @@ def update_proximity_broadcast_settings(settings: dict):
     if 'proximity_max_broadcasts_per_agent' in settings:
         PROXIMITY_MAX_BROADCASTS_PER_AGENT = int(settings['proximity_max_broadcasts_per_agent'])
         log_event(f"[ProximityBroadcast] Max broadcasts per agent set to {PROXIMITY_MAX_BROADCASTS_PER_AGENT}")
+
+    if 'min_auto_assign_score_percent' in settings:
+        try:
+            score_threshold = int(float(settings['min_auto_assign_score_percent']))
+        except (TypeError, ValueError):
+            score_threshold = 0
+        PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT = max(0, min(100, score_threshold))
+        log_event(f"[ProximityBroadcast] Min auto-assign score set to {PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT}%")
 
 
 def expand_task_radius(task_id: str, new_radius_km: float, dashboard_url: str) -> dict:
@@ -2698,6 +2678,8 @@ try:
 except ImportError:
     FLEET_AVAILABLE = False
     print("Warning: Fleet optimization not available")
+
+from delivery_route_score import choose_delivery_tasks
 
 
 # =============================================================================
@@ -3440,8 +3422,9 @@ def handle_fleet_sync(data):
                 fleet_state.chain_lookahead_radius_km = float(config['default_max_distance_km'])
                 print(f"[FleetState] → chain_lookahead_radius_km = {fleet_state.chain_lookahead_radius_km}km (synced with max_distance)")
             
-            if 'max_lateness_minutes' in config:
-                fleet_state.max_lateness_minutes = int(config['max_lateness_minutes'])
+            lateness_cutoff = _lateness_cutoff_minutes(config)
+            if lateness_cutoff is not None:
+                fleet_state.max_lateness_minutes = lateness_cutoff
                 print(f"[FleetState] → max_lateness_minutes = {fleet_state.max_lateness_minutes}min")
             
             if 'max_pickup_delay_minutes' in config:
@@ -3509,7 +3492,10 @@ def handle_fleet_sync(data):
                 safe_config = {k: v for k, v in config.items() if k != 'proximity_broadcast_enabled'}
                 if safe_config:
                     update_proximity_broadcast_settings(safe_config)
-                print(f"[FleetState] → proximity_broadcast = {'ENABLED' if PROXIMITY_BROADCAST_ENABLED else 'DISABLED'} (preserved), timeout = {PROXIMITY_TASK_TIMEOUT_SECONDS}s, maxBcast = {PROXIMITY_MAX_BROADCASTS_PER_AGENT}")
+            if 'min_auto_assign_score_percent' not in config and PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT != 0:
+                update_proximity_broadcast_settings({'min_auto_assign_score_percent': 0})
+            if any(k in config for k in proximity_config_keys) or 'min_auto_assign_score_percent' in config:
+                print(f"[FleetState] → proximity_broadcast = {'ENABLED' if PROXIMITY_BROADCAST_ENABLED else 'DISABLED'} (preserved), timeout = {PROXIMITY_TASK_TIMEOUT_SECONDS}s, maxBcast = {PROXIMITY_MAX_BROADCASTS_PER_AGENT}, minScore = {PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT}%")
             
             print(f"[FleetState] Applied config: max_dist={fleet_state.max_distance_km}km, chain_lookahead={fleet_state.chain_lookahead_radius_km}km, capacity={fleet_state.default_max_capacity}, wallet={fleet_state.wallet_threshold}")
         
@@ -3551,6 +3537,7 @@ def handle_fleet_sync(data):
                 'proximity_broadcast_enabled': PROXIMITY_BROADCAST_ENABLED,
                 'proximity_task_timeout_seconds': PROXIMITY_TASK_TIMEOUT_SECONDS,
                 'proximity_max_broadcasts_per_agent': PROXIMITY_MAX_BROADCASTS_PER_AGENT,
+                'min_auto_assign_score_percent': PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT,
                 'merchant_agent_exclusions': {
                     merchant: list(agent_ids)
                     for merchant, agent_ids in fleet_state.merchant_agent_exclusions.items()
@@ -3644,9 +3631,10 @@ def handle_config_update(data):
             fleet_state.chain_lookahead_radius_km = max_dist  # Keep chain lookahead in sync too
             changes.append(f"max_distance_km: {old_val} → {max_dist}")
         
-        if 'max_lateness_minutes' in config:
+        lateness_cutoff = _lateness_cutoff_minutes(config)
+        if lateness_cutoff is not None:
             old_val = fleet_state.max_lateness_minutes
-            fleet_state.max_lateness_minutes = int(config['max_lateness_minutes'])
+            fleet_state.max_lateness_minutes = lateness_cutoff
             changes.append(f"max_lateness_minutes: {old_val} → {fleet_state.max_lateness_minutes}")
         
         if 'max_pickup_delay_minutes' in config:
@@ -3724,6 +3712,15 @@ def handle_config_update(data):
             old_val = PROXIMITY_MAX_BROADCASTS_PER_AGENT
             update_proximity_broadcast_settings({'proximity_max_broadcasts_per_agent': config['proximity_max_broadcasts_per_agent']})
             changes.append(f"proximity_max_broadcasts_per_agent: {old_val} → {PROXIMITY_MAX_BROADCASTS_PER_AGENT}")
+
+        if 'min_auto_assign_score_percent' in config:
+            old_val = PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT
+            update_proximity_broadcast_settings({'min_auto_assign_score_percent': config['min_auto_assign_score_percent']})
+            changes.append(f"min_auto_assign_score_percent: {old_val} → {PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT}")
+        elif PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT != 0:
+            old_val = PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT
+            update_proximity_broadcast_settings({'min_auto_assign_score_percent': 0})
+            changes.append(f"min_auto_assign_score_percent: {old_val} → 0")
         
         if 'direction_coherence_mode' in config:
             mode = str(config['direction_coherence_mode']).lower()
@@ -3757,6 +3754,7 @@ def handle_config_update(data):
                 'proximity_task_timeout_seconds': PROXIMITY_TASK_TIMEOUT_SECONDS,
                 'proximity_default_radius_km': PROXIMITY_DEFAULT_RADIUS_KM,
                 'proximity_max_broadcasts_per_agent': PROXIMITY_MAX_BROADCASTS_PER_AGENT,
+                'min_auto_assign_score_percent': PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT,
                 'direction_coherence_mode': fleet_state.direction_coherence_mode,
                 'merchant_agent_exclusions': {
                     merchant: list(agent_ids)
@@ -3893,7 +3891,13 @@ def handle_get_recommendations(data):
                 eligibility = fleet_state._check_eligibility(agent, task, override_max_distance_km=search_radius)
                 
                 if eligibility is None and min_dist <= search_radius:
-                    # Agent is eligible - add to recommendations
+                    try:
+                        evaluation = _evaluate_new_tasks_for_agent(agent, [task])
+                    except Exception as route_error:
+                        print(f"[WebSocket] Delivery-lateness score failed for {agent.name}: {route_error}")
+                        continue
+                    if not evaluation.get('feasible'):
+                        continue
                     recommendations.append({
                         'driver_id': agent.id,
                         'name': agent.name,
@@ -3901,12 +3905,12 @@ def handle_get_recommendations(data):
                         'current_task_count': len(agent.current_tasks),
                         'available_capacity': agent.available_capacity,
                         'priority': agent.priority,
-                        'score': 100 - int(min_dist * 10),  # Simple distance-based score
+                        'score': evaluation.get('score'),
+                        'delivery_lateness_minutes': evaluation.get('delivery_lateness_minutes'),
                         'proximity_eligible': True
                     })
             
-            # Sort by distance
-            recommendations.sort(key=lambda x: x['distance_km'])
+            recommendations.sort(key=lambda x: (-int(x.get('score') or 0), x['distance_km']))
             
             execution_time = time.time() - start_time
             
@@ -6103,7 +6107,8 @@ def fleet_state_config():
             'proximity_task_timeout_seconds': PROXIMITY_TASK_TIMEOUT_SECONDS,
             'proximity_default_radius_km': PROXIMITY_DEFAULT_RADIUS_KM,
             'proximity_max_radius_km': PROXIMITY_MAX_RADIUS_KM,
-            'proximity_max_broadcasts_per_agent': PROXIMITY_MAX_BROADCASTS_PER_AGENT
+            'proximity_max_broadcasts_per_agent': PROXIMITY_MAX_BROADCASTS_PER_AGENT,
+            'min_auto_assign_score_percent': PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT
         }), 200
     
     # POST - update config
@@ -6121,8 +6126,9 @@ def fleet_state_config():
         fleet_state.assignment_radius_km = radius
         fleet_state.max_distance_km = radius
         fleet_state.chain_lookahead_radius_km = radius  # Keep chain lookahead in sync too
-    if 'max_lateness_minutes' in data:
-        fleet_state.max_lateness_minutes = int(data['max_lateness_minutes'])
+    lateness_cutoff = _lateness_cutoff_minutes(data)
+    if lateness_cutoff is not None:
+        fleet_state.max_lateness_minutes = lateness_cutoff
     if 'max_pickup_delay_minutes' in data:
         fleet_state.max_pickup_delay_minutes = int(data['max_pickup_delay_minutes'])
     if 'wallet_threshold' in data:
@@ -6140,7 +6146,13 @@ def fleet_state_config():
             log_event(f"[Config] Direction coherence mode changed to: {mode}")
     
     # Proximity broadcast settings
-    if 'proximity_broadcast_enabled' in data or 'proximity_task_timeout_seconds' in data:
+    if any(key in data for key in (
+        'proximity_broadcast_enabled',
+        'proximity_task_timeout_seconds',
+        'proximity_default_radius_km',
+        'proximity_max_broadcasts_per_agent',
+        'min_auto_assign_score_percent',
+    )):
         update_proximity_broadcast_settings(data)
     
     return jsonify({
@@ -6157,7 +6169,8 @@ def fleet_state_config():
         'proximity_task_timeout_seconds': PROXIMITY_TASK_TIMEOUT_SECONDS,
         'proximity_default_radius_km': PROXIMITY_DEFAULT_RADIUS_KM,
         'proximity_max_radius_km': PROXIMITY_MAX_RADIUS_KM,
-        'proximity_max_broadcasts_per_agent': PROXIMITY_MAX_BROADCASTS_PER_AGENT
+        'proximity_max_broadcasts_per_agent': PROXIMITY_MAX_BROADCASTS_PER_AGENT,
+        'min_auto_assign_score_percent': PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT
     }), 200
 
 
