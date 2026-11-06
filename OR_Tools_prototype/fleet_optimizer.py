@@ -131,6 +131,7 @@ class Task:
     meta: Dict[str, Any] = field(default_factory=dict)
     tips: float = 0.0
     delivery_fee: float = 0.0
+    region_broadcast_counts: Dict[str, int] = field(default_factory=dict)
 
     @property
     def restaurant_name(self) -> str:
@@ -175,6 +176,12 @@ class Task:
                     declined_by.append(str(d))
             if declined_by:
                 logger.info(f"[FleetOptimizer] 📥 Task {data.get('id', '')[:20]}... has {len(declined_by)} declines: {declined_by}")
+
+        raw_counts = data.get('region_broadcast_counts') or {}
+        region_broadcast_counts = {
+            str(agent_id): int(count)
+            for agent_id, count in raw_counts.items()
+        } if isinstance(raw_counts, dict) else {}
         
         # Get metadata
         meta = data.get('_meta', {})
@@ -196,7 +203,8 @@ class Task:
             declined_by=declined_by,
             meta=meta,
             tips=float(data.get('tips') or meta.get('tips') or 0.0),
-            delivery_fee=float(data.get('delivery_fee') or meta.get('delivery_fee') or 0.0)
+            delivery_fee=float(data.get('delivery_fee') or meta.get('delivery_fee') or 0.0),
+            region_broadcast_counts=region_broadcast_counts,
         )
     
     @staticmethod
@@ -489,6 +497,7 @@ class CompatibilityChecker:
                  merchant_agent_exclusions: Dict[str, List[str]] = None,
                  customer_agent_exclusions: Dict[str, List[str]] = None,
                  online_agent_ids: Optional[List[str]] = None,
+                 broadcast_cap: Optional[int] = None,
                  road_distance_provider: Optional[
                      Callable[[List[Location], List[Location]], Tuple[List[List[float]], str]]
                  ] = None):
@@ -505,6 +514,7 @@ class CompatibilityChecker:
             {str(agent_id) for agent_id in online_agent_ids}
             if online_agent_ids is not None else None
         )
+        self.broadcast_cap = None if broadcast_cap is None else int(broadcast_cap)
         self.road_distance_provider = (
             road_distance_provider or get_osrm_distances_matrix_with_source
         )
@@ -775,6 +785,8 @@ class CompatibilityChecker:
             task,
             [region.to_policy_dict() for region in self.geofence_regions],
             online_agent_ids,
+            broadcast_counts=getattr(task, 'region_broadcast_counts', None),
+            broadcast_cap=self.broadcast_cap,
         )
         if not region_decision['eligible']:
             return False, region_decision['reason']
@@ -2770,6 +2782,8 @@ def optimize_fleet(agents_data: Dict, tasks_data: Dict, prefilter_distance: bool
     premium_delivery_fee_threshold = settings.get('premiumDeliveryFeeThreshold', DEFAULT_PREMIUM_DELIVERY_FEE_THRESHOLD)
     merchant_agent_exclusions = settings.get('merchantAgentExclusions', {})
     customer_agent_exclusions = settings.get('customerAgentExclusions', {})
+    raw_broadcast_cap = settings.get('proximityMaxBroadcastsPerAgent')
+    broadcast_cap = None if raw_broadcast_cap is None else int(raw_broadcast_cap)
 
     # Apply thresholds globally to parsed Task objects for this optimization call.
     Task.PREMIUM_TIP_THRESHOLD = float(premium_tip_threshold)
@@ -2792,7 +2806,8 @@ def optimize_fleet(agents_data: Dict, tasks_data: Dict, prefilter_distance: bool
         premium_delivery_fee_threshold=Task.PREMIUM_DELIVERY_FEE_THRESHOLD,
         merchant_agent_exclusions=merchant_agent_exclusions,
         customer_agent_exclusions=customer_agent_exclusions,
-        online_agent_ids=agents_data.get('online_agent_ids')
+        online_agent_ids=agents_data.get('online_agent_ids'),
+        broadcast_cap=broadcast_cap,
     )
     
     # Run optimizer

@@ -454,6 +454,7 @@ class FleetState:
         self._preserved_assignments: Dict[str, str] = {}  # Preserved optimistic assignments (task_id -> agent_id)
         self._dashboard_unassigned_tasks: set = set()  # Task IDs dashboard explicitly says are unassigned
         self._task_expanded_radii: Dict[str, float] = {}  # Task-specific expanded radii
+        self._region_claim_provider = None  # task_id -> broadcast counts and cap
         
         # Optimization tracking
         self._last_optimization_time: Dict[str, float] = {}  # agent_id -> timestamp
@@ -1774,14 +1775,22 @@ class FleetState:
             if agent.wallet_balance > self.wallet_threshold:
                 return f"wallet_too_high ({agent.wallet_balance:.2f} > {self.wallet_threshold:.2f})"
         
-        # 6. Shared region policy: overlap union, Region-first precedence/fallback,
+        # 6. Shared region policy: overlap union, Region-first claim/fallback,
         # route coverage, and subscribed-agent reverse locks.
+        # A Region First member holds the task only while they can still be
+        # offered it. A decline or a full broadcast cap releases the lock.
         online_agent_ids = [
             agent_id for agent_id, current_agent in self._agents.items()
             if current_agent.is_online
         ]
+        claim = self._region_claim_context(task.id)
         region_decision = evaluate_region_eligibility(
-            agent.id, task, self._geofences.values(), online_agent_ids
+            agent.id,
+            task,
+            self._geofences.values(),
+            online_agent_ids,
+            broadcast_counts=claim['broadcast_counts'],
+            broadcast_cap=claim['broadcast_cap'],
         )
         if not region_decision['eligible']:
             matched_names = ', '.join(
@@ -1793,6 +1802,15 @@ class FleetState:
                 f"matched=[{matched_names}]"
             )
             return region_decision['reason']
+        if (
+            region_decision.get('claim_released')
+            and str(agent.id) not in set(region_decision.get('permitted_member_ids') or [])
+        ):
+            logger.info(
+                f"[Geofence] RELEASE: task={task.id[:20]} region-first members "
+                f"declined or hit the broadcast cap; {agent.name} can take it "
+                f"under normal rules"
+            )
         skip_distance_for_region = region_decision['distance_bypass']
         
         # 7. Check max distance (using current or projected location)
@@ -1928,6 +1946,28 @@ class FleetState:
         else:  # -67.5 <= angle < -22.5
             return "NW"
     
+    def set_region_claim_provider(self, provider) -> None:
+        """Register who can still be offered a Region First task.
+
+        provider(task_id) returns broadcast_counts and broadcast_cap. A missing
+        provider leaves the cap unused, so only declines release the claim.
+        """
+        self._region_claim_provider = provider
+
+    def _region_claim_context(self, task_id: str) -> Dict[str, Any]:
+        provider = self._region_claim_provider
+        if provider is None:
+            return {'broadcast_counts': {}, 'broadcast_cap': None}
+        context = provider(str(task_id)) or {}
+        raw_counts = context.get('broadcast_counts') or {}
+        cap = context.get('broadcast_cap')
+        return {
+            'broadcast_counts': {
+                str(agent_id): int(count) for agent_id, count in raw_counts.items()
+            },
+            'broadcast_cap': None if cap is None else int(cap),
+        }
+
     def _get_task_regions(self, task: 'TaskState') -> List[Dict[str, Any]]:
         """Return every policy-matching region for the task."""
         return matching_regions(task, self._geofences.values())
@@ -2839,24 +2879,29 @@ class FleetState:
                     'route_coverage': gf.get('route_coverage')
                 })
             
+            settings_used = {
+                'walletNoCashThreshold': self.wallet_threshold,
+                'maxDistanceKm': self.max_distance_km,
+                'maxLatenessMinutes': self.max_lateness_minutes,
+                'maxPickupDelayMinutes': self.max_pickup_delay_minutes,
+                'merchantAgentExclusions': {
+                    merchant: list(agent_ids)
+                    for merchant, agent_ids in self.merchant_agent_exclusions.items()
+                },
+                'customerAgentExclusions': {
+                    customer: list(agent_ids)
+                    for customer, agent_ids in self.customer_agent_exclusions.items()
+                }
+            }
+            broadcast_cap = self._region_claim_context('').get('broadcast_cap')
+            if broadcast_cap is not None:
+                settings_used['proximityMaxBroadcastsPerAgent'] = broadcast_cap
+
             return {
                 'agents': agents_list,
                 'online_agent_ids': [agent.id for agent in self._agents.values() if agent.is_online],
                 'geofence_data': geofence_data,
-                'settings_used': {
-                    'walletNoCashThreshold': self.wallet_threshold,
-                    'maxDistanceKm': self.max_distance_km,
-                    'maxLatenessMinutes': self.max_lateness_minutes,
-                    'maxPickupDelayMinutes': self.max_pickup_delay_minutes,
-                    'merchantAgentExclusions': {
-                        merchant: list(agent_ids)
-                        for merchant, agent_ids in self.merchant_agent_exclusions.items()
-                    },
-                    'customerAgentExclusions': {
-                        customer: list(agent_ids)
-                        for customer, agent_ids in self.customer_agent_exclusions.items()
-                    }
-                }
+                'settings_used': settings_used,
             }
     
     def export_tasks_for_optimizer(self) -> Dict[str, Any]:
@@ -2875,6 +2920,7 @@ class FleetState:
                 # CRITICAL: Ensure all IDs are strings for consistent comparison
                 declined_by_list = [str(agent_id) for agent_id in task.declined_by] if hasattr(task, 'declined_by') else []
                 declined_by = [{'driver_id': agent_id} for agent_id in declined_by_list]
+                claim = self._region_claim_context(task.id)
                 
                 # Log declined_by for tracking - INFO level for persistent logging
                 if declined_by_list:
@@ -2900,6 +2946,7 @@ class FleetState:
                     'tips': task.tips,
                     'max_distance_km': task.max_distance_km,
                     'declined_by': declined_by,
+                    'region_broadcast_counts': claim['broadcast_counts'],
                     '_meta': task_meta
                 })
             

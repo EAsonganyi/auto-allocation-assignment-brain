@@ -1051,6 +1051,24 @@ PROXIMITY_TASK_TIMEOUT_SECONDS = 120  # How long before task re-broadcasts (defa
 PROXIMITY_DEFAULT_RADIUS_KM = 3.0  # Default search radius
 PROXIMITY_MAX_RADIUS_KM = 10.0  # Maximum expanded radius
 PROXIMITY_MAX_BROADCASTS_PER_AGENT = 3  # Max times a task can be broadcast to the same agent
+
+
+def _region_claim_context(task_id: str) -> dict:
+    """Broadcast counts and cap used to release a Region First claim."""
+    with _proximity_lock:
+        counts = {
+            str(agent_id): int(count)
+            for agent_id, count in _task_agent_broadcast_counts.get(str(task_id), {}).items()
+        }
+    return {
+        'broadcast_counts': counts,
+        'broadcast_cap': PROXIMITY_MAX_BROADCASTS_PER_AGENT,
+    }
+
+
+if FLEET_STATE_AVAILABLE and fleet_state:
+    fleet_state.set_region_claim_provider(_region_claim_context)
+
 PROXIMITY_MIN_AUTO_ASSIGN_SCORE_PERCENT = 0  # 0 until the dashboard sends Min Auto-Assign Score
 PROXIMITY_BATCH_DIRECTION_TOLERANCE_DEGREES = 90  # Max angular difference for tasks to be batched together
 PROXIMITY_DIRECTION_FILTER_ENABLED = False  # Off by default. The solver decides headings unless the debugger turns this on.
@@ -3344,7 +3362,8 @@ def trigger_incremental_optimization(
                 'walletNoCashThreshold': fleet_state.wallet_threshold,
                 'maxDistanceKm': fleet_state.max_distance_km,
                 'premiumTipThreshold': fleet_state.premium_tip_threshold,
-                'premiumDeliveryFeeThreshold': fleet_state.premium_delivery_fee_threshold
+                'premiumDeliveryFeeThreshold': fleet_state.premium_delivery_fee_threshold,
+                'proximityMaxBroadcastsPerAgent': PROXIMITY_MAX_BROADCASTS_PER_AGENT,
             }
         }
         

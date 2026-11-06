@@ -17,6 +17,7 @@ class Task:
     restaurant_location: Location
     delivery_location: Location
     job_type: str = 'PAIRED'
+    declined_by: tuple = ()
 
 
 def square(minimum, maximum):
@@ -77,6 +78,66 @@ class TestRegionPolicy(unittest.TestCase):
         self.assertTrue(open_member['eligible'])
         self.assertFalse(open_member['distance_bypass'])
         self.assertTrue(first_member['distance_bypass'])
+
+    def test_decline_releases_when_every_member_has_refused(self):
+        task = Task(Location(5, 5), Location(6, 6), declined_by=('only-member',))
+        regions = [region('first', square(0, 10), ['only-member'])]
+        released = evaluate_region_eligibility(
+            'outsider', task, regions, ['outsider', 'only-member']
+        )
+        self.assertTrue(released['eligible'])
+        self.assertTrue(released['claim_released'])
+        self.assertFalse(released['distance_bypass'])
+
+    def test_one_member_decline_keeps_the_claim_for_the_other(self):
+        task = Task(Location(5, 5), Location(6, 6), declined_by=('member-a',))
+        regions = [region('first', square(0, 10), ['member-a', 'member-b'])]
+        online = ['outsider', 'member-a', 'member-b']
+        blocked = evaluate_region_eligibility('outsider', task, regions, online)
+        still_holding = evaluate_region_eligibility('member-b', task, regions, online)
+        exhausted = evaluate_region_eligibility('member-a', task, regions, online)
+        self.assertFalse(blocked['eligible'])
+        self.assertEqual(blocked['reason'], 'not_in_task_region')
+        self.assertTrue(still_holding['eligible'])
+        self.assertTrue(still_holding['distance_bypass'])
+        self.assertFalse(exhausted['distance_bypass'])
+
+    def test_broadcast_cap_releases_when_every_member_is_exhausted(self):
+        task = Task(Location(5, 5), Location(6, 6))
+        regions = [region('first', square(0, 10), ['only-member'])]
+        released = evaluate_region_eligibility(
+            'outsider',
+            task,
+            regions,
+            ['outsider', 'only-member'],
+            broadcast_counts={'only-member': 3},
+            broadcast_cap=3,
+        )
+        self.assertTrue(released['eligible'])
+        self.assertTrue(released['claim_released'])
+        self.assertEqual(released['claiming_member_ids'], [])
+
+    def test_broadcast_cap_keeps_the_claim_while_any_member_can_be_offered(self):
+        task = Task(Location(5, 5), Location(6, 6))
+        regions = [region('first', square(0, 10), ['member-a', 'member-b'])]
+        online = ['outsider', 'member-a', 'member-b']
+        blocked = evaluate_region_eligibility(
+            'outsider',
+            task,
+            regions,
+            online,
+            broadcast_counts={'member-a': 3, 'member-b': 2},
+            broadcast_cap=3,
+        )
+        self.assertFalse(blocked['eligible'])
+        self.assertEqual(blocked['claiming_member_ids'], ['member-b'])
+
+    def test_reverse_lock_survives_a_released_claim(self):
+        regions = [region('first', square(0, 10), ['member'])]
+        outside = Task(Location(40, 40), Location(45, 45), declined_by=('member',))
+        decision = evaluate_region_eligibility('member', outside, regions, ['member'])
+        self.assertFalse(decision['eligible'])
+        self.assertEqual(decision['reason'], 'agent_restricted_to_region')
 
     def test_unstaffed_region_first_falls_back_globally(self):
         task = Task(Location(5, 5), Location(20, 20))

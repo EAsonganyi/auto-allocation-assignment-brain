@@ -1,6 +1,6 @@
 """Shared region-policy matching for fleet pre-filtering and solver checks."""
 
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 
 VALID_SHARING_MODES = {'open_access', 'region_first'}
@@ -116,37 +116,93 @@ def matching_regions(task: Any, regions: Iterable[Any]) -> List[Dict[str, Any]]:
     return [region for region in normalized_regions if task_matches_region(task, region)]
 
 
+def _declined_agent_ids(task: Any) -> set:
+    raw = getattr(task, 'declined_by', None) or []
+    declined = set()
+    for item in raw:
+        if isinstance(item, dict):
+            agent_id = item.get('driver_id', item.get('agent_id'))
+        else:
+            agent_id = item
+        if agent_id is not None and str(agent_id).strip():
+            declined.add(str(agent_id))
+    return declined
+
+
+def _broadcast_counts(broadcast_counts: Optional[Mapping[Any, Any]]) -> Dict[str, int]:
+    if not broadcast_counts:
+        return {}
+    return {
+        str(agent_id): int(count)
+        for agent_id, count in broadcast_counts.items()
+    }
+
+
+def _member_still_claiming(
+    agent_id: str,
+    online_ids: set,
+    declined_ids: set,
+    broadcast_counts: Dict[str, int],
+    broadcast_cap: Optional[int],
+) -> bool:
+    """A Region First member holds a task while they can still be offered it."""
+    if agent_id not in online_ids or agent_id in declined_ids:
+        return False
+    if broadcast_cap is not None and broadcast_counts.get(agent_id, 0) >= broadcast_cap:
+        return False
+    return True
+
+
 def evaluate_region_eligibility(
     agent_id: str,
     task: Any,
     regions: Iterable[Any],
     online_agent_ids: Iterable[str],
+    broadcast_counts: Optional[Mapping[Any, Any]] = None,
+    broadcast_cap: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Apply overlap union, Region-first precedence, fallback, and reverse locks."""
+    """Apply overlap union, Region-first claim, fallback, and reverse locks.
+
+    A staffed Region First region holds the task for its members only while at
+    least one subscribed agent is still online, has not declined it, and is
+    under the broadcast cap. When none of them can still be offered the task,
+    the lock drops and other agents follow the normal rules.
+    """
     normalized_agent_id = str(agent_id)
     normalized_regions = [normalize_region(region) for region in regions]
     online_ids = {str(value) for value in online_agent_ids}
+    declined_ids = _declined_agent_ids(task)
+    counts = _broadcast_counts(broadcast_counts)
+    cap = None if broadcast_cap is None else int(broadcast_cap)
     matched = [region for region in normalized_regions if task_matches_region(task, region)]
     matched_ids = {region['id'] for region in matched}
     agent_regions = [
         region for region in normalized_regions
         if normalized_agent_id in region['agent_ids']
     ]
+    claiming_by_region = {
+        region['id']: {
+            member_id for member_id in region['agent_ids']
+            if _member_still_claiming(member_id, online_ids, declined_ids, counts, cap)
+        }
+        for region in matched
+        if region['sharing_mode'] == 'region_first'
+    }
     staffed_region_first = [
         region for region in matched
-        if region['sharing_mode'] == 'region_first'
-        and bool(region['agent_ids'] & online_ids)
+        if region['sharing_mode'] == 'region_first' and claiming_by_region.get(region['id'])
     ]
+    claiming_member_ids = set().union(*claiming_by_region.values()) if claiming_by_region else set()
     permitted_member_ids = set().union(
         *(region['agent_ids'] for region in matched)
     ) if matched else set()
     agent_matches_subscription = any(
         region['id'] in matched_ids for region in agent_regions
     )
-    distance_bypass = any(
-        normalized_agent_id in region['agent_ids']
-        for region in staffed_region_first
-    )
+    distance_bypass = normalized_agent_id in claiming_member_ids
+    matched_region_first = [
+        region for region in matched if region['sharing_mode'] == 'region_first'
+    ]
 
     result = {
         'eligible': True,
@@ -155,8 +211,10 @@ def evaluate_region_eligibility(
         'matching_region_ids': [region['id'] for region in matched],
         'agent_region_ids': [region['id'] for region in agent_regions],
         'staffed_region_first_ids': [region['id'] for region in staffed_region_first],
+        'claiming_member_ids': sorted(claiming_member_ids),
         'permitted_member_ids': sorted(permitted_member_ids),
         'restrict_to_members': bool(staffed_region_first),
+        'claim_released': bool(matched_region_first) and not staffed_region_first,
         'distance_bypass': distance_bypass,
     }
 

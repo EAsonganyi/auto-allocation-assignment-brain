@@ -286,6 +286,39 @@ class TestCheckEligibilityGeofence(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertIn('not_in_task_region', result)
 
+    def test_decline_by_every_member_opens_the_task(self):
+        """Online members who all declined no longer keep the region locked."""
+        task = _make_task('t1', LOC_IN_KINGSTON, LOC_OUTSIDE)
+        task.declined_by.update({'agent_1', 'agent_2'})
+        result = self.fs._check_eligibility(self.agent_outside_region, task)
+        self.assertIsNone(result, f"Expected eligible, got: {result}")
+
+        far_outsider = _make_agent('agent_far', 'Farah', LOC_OUTSIDE, online=True)
+        self.fs._agents['agent_far'] = far_outsider
+        far_result = self.fs._check_eligibility(far_outsider, task)
+        self.assertIn('too_far', far_result)
+
+    def test_one_member_decline_does_not_open_the_task(self):
+        task = _make_task('t1', LOC_IN_KINGSTON, LOC_OUTSIDE)
+        task.declined_by.add('agent_1')
+        result = self.fs._check_eligibility(self.agent_outside_region, task)
+        self.assertIn('not_in_task_region', result)
+
+    def test_broadcast_cap_opens_the_task_after_every_member_is_exhausted(self):
+        counts = {'t1': {'agent_1': 3, 'agent_2': 3}}
+
+        def provider(task_id):
+            return {'broadcast_counts': counts.get(str(task_id), {}), 'broadcast_cap': 3}
+
+        self.fs.set_region_claim_provider(provider)
+        task = _make_task('t1', LOC_IN_KINGSTON, LOC_OUTSIDE)
+        result = self.fs._check_eligibility(self.agent_outside_region, task)
+        self.assertIsNone(result, f"Expected eligible, got: {result}")
+
+        counts['t1']['agent_2'] = 2
+        held = self.fs._check_eligibility(self.agent_outside_region, task)
+        self.assertIn('not_in_task_region', held)
+
     def test_no_online_region_agents_fallback(self):
         """Task in region but all region agents offline -> fallback, distance applies."""
         self.fs._agents['agent_1'].status = AgentStatus.OFFLINE
@@ -677,6 +710,43 @@ class TestOptimizerNonScooterGeofence(unittest.TestCase):
 
         is_compat_mobay, reason_mobay = checker.is_compatible(self.agent_in_mobay, task)
         self.assertTrue(is_compat_mobay, f"Expected MoBay agent compatible, got: {reason_mobay}")
+
+    def test_declined_region_member_releases_outsiders(self):
+        checker = self._make_checker(
+            geofence_regions=[self.kgn_geofence],
+            max_distance_km=50.0,
+            broadcast_cap=3,
+        )
+        checker._all_agents = self.all_agents
+        task = self._make_optimizer_task(
+            't1',
+            OptimizerLocation(18.03, -76.77),
+            OptimizerLocation(17.90, -76.50),
+        )
+        task.declined_by = ['agent_1']
+        is_compat, reason = checker.is_compatible(self.agent_outside, task)
+        self.assertTrue(is_compat, f"Expected compatible after decline, got: {reason}")
+
+    def test_broadcast_cap_releases_outsiders(self):
+        checker = self._make_checker(
+            geofence_regions=[self.kgn_geofence],
+            max_distance_km=50.0,
+            broadcast_cap=3,
+        )
+        checker._all_agents = self.all_agents
+        task = self._make_optimizer_task(
+            't1',
+            OptimizerLocation(18.03, -76.77),
+            OptimizerLocation(17.90, -76.50),
+        )
+        task.region_broadcast_counts = {'agent_1': 3}
+        is_compat, reason = checker.is_compatible(self.agent_outside, task)
+        self.assertTrue(is_compat, f"Expected compatible after broadcast cap, got: {reason}")
+
+        task.region_broadcast_counts = {'agent_1': 2}
+        is_compat, reason = checker.is_compatible(self.agent_outside, task)
+        self.assertFalse(is_compat)
+        self.assertIn('not_in_task_region', reason)
 
 
 # ===========================================================================
