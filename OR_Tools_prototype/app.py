@@ -369,6 +369,10 @@ def _stale_noop_ack(
 
 # Proximity Broadcast mode tracking
 _proximity_lock = threading.Lock()
+# Counts use their own lock. Eligibility reads them while the fleet lock is held,
+# and broadcasts take the fleet lock while holding _proximity_lock. Sharing
+# _proximity_lock here deadlocks those two paths.
+_broadcast_counts_lock = threading.Lock()
 _last_proximity_broadcast = {}  # Track last broadcast per task: {task_id: timestamp}
 _task_offer_times = {}  # Track when each task was first offered: {task_id: timestamp}
 _task_expanded_radius = {}  # Track expanded radius per task: {task_id: radius_km}
@@ -1010,14 +1014,14 @@ def _stops_overlap(task_a, task_b, threshold_km: float) -> bool:
 
 def get_task_broadcast_count_for_agent(task_id: str, agent_id: str) -> int:
     """Get how many times a task has been broadcast to a specific agent."""
-    with _proximity_lock:
+    with _broadcast_counts_lock:
         task_counts = _task_agent_broadcast_counts.get(str(task_id), {})
         return task_counts.get(str(agent_id), 0)
 
 
 def increment_task_broadcast_count(task_id: str, agent_id: str) -> int:
     """Increment and return the broadcast count for a task->agent pair."""
-    with _proximity_lock:
+    with _broadcast_counts_lock:
         task_key = str(task_id)
         agent_key = str(agent_id)
         if task_key not in _task_agent_broadcast_counts:
@@ -1030,13 +1034,13 @@ def increment_task_broadcast_count(task_id: str, agent_id: str) -> int:
 
 def clear_task_broadcast_counts(task_id: str):
     """Clear all broadcast counts for a task (when task is assigned/completed/cancelled)."""
-    with _proximity_lock:
+    with _broadcast_counts_lock:
         _task_agent_broadcast_counts.pop(str(task_id), None)
 
 
 def get_agents_at_broadcast_limit(task_id: str) -> set:
     """Get set of agent IDs that have hit the broadcast limit for this task."""
-    with _proximity_lock:
+    with _broadcast_counts_lock:
         task_counts = _task_agent_broadcast_counts.get(str(task_id), {})
         return {
             agent_id for agent_id, count in task_counts.items()
@@ -1054,8 +1058,11 @@ PROXIMITY_MAX_BROADCASTS_PER_AGENT = 3  # Max times a task can be broadcast to t
 
 
 def _region_claim_context(task_id: str) -> dict:
-    """Broadcast counts and cap used to release a Region First claim."""
-    with _proximity_lock:
+    """Broadcast counts and cap used to release a Region First claim.
+
+    Called while the fleet lock is held, so this must not take _proximity_lock.
+    """
+    with _broadcast_counts_lock:
         counts = {
             str(agent_id): int(count)
             for agent_id, count in _task_agent_broadcast_counts.get(str(task_id), {}).items()
